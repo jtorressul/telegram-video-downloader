@@ -506,11 +506,19 @@ class VideoDownloader:
                     "YouTube ha bloqueado temporalmente las descargas para la IP del servidor en la nube (Render). "
                     "Para solucionarlo de inmediato, añade tus cookies en la variable de entorno YOUTUBE_COOKIES en Render."
                 )
-            if platform_name == "Instagram" and ('empty media response' in err_text or 'login' in err_text.lower() or 'checkpoint' in err_text.lower()):
-                raise ValueError(
-                    "Instagram requiere autenticación para procesar este video. "
-                    "Añade tu cookie de sesión de Instagram configurando INSTAGRAM_SESSIONID=tu_session_id en el archivo .env."
-                )
+            if platform_name == "Instagram":
+                err_lower = err_text.lower()
+                if any(k in err_lower for k in [
+                    'ciertas audiencias', 'audiences', 'restricted', 'restricción',
+                    'empty media response', 'login', 'checkpoint', 'disponible para todo el mundo'
+                ]):
+                    raise ValueError(
+                        "🔒 Video con Restricción de Edad o Audiencia en Instagram.\n\n"
+                        "Instagram bloquea el acceso anónimo a este contenido (+18 o audiencia sensible).\n\n"
+                        "💡 Para descargar videos restringidos: Añade tu sesión de Instagram en tu archivo .env:\n"
+                        "INSTAGRAM_SESSIONID=tu_session_id\n\n"
+                        "(Obtén el valor de la cookie 'sessionid' desde instagram.com en tu navegador -> F12 -> Almacenamiento/Storage -> Cookies)"
+                    )
             raise ValueError(f"Error al descargar: {err_text}")
 
         if 'entries' in info and info['entries']:
