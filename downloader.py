@@ -78,7 +78,7 @@ def detect_platform(url: str) -> Tuple[str, str]:
         return "Spotify", "🟢"
     elif any(k in url_lower for k in ['tiktok.com']):
         return "TikTok", "🎵"
-    elif any(k in url_lower for k in ['instagram.com', 'instagr.am']):
+    elif any(k in url_lower for k in ['instagram.com', 'instagr.am', 'ig.me']):
         return "Instagram", "📸"
     elif any(k in url_lower for k in ['twitter.com', 'x.com']):
         return "X (Twitter)", "🐦"
@@ -209,16 +209,84 @@ def compress_video_ffmpeg(input_file: str, output_file: str, duration: float) ->
     return False
 
 
+def normalize_instagram_url(url: str) -> str:
+    """
+    Normalizes Instagram URLs to clean, standard formats recognized by extractors.
+    Handles /share/reel/ID, /share/p/ID, /share/ID, query parameter stripping, etc.
+    """
+    if not url:
+        return url
+
+    try:
+        parsed = urlparse(url)
+        path = parsed.path.rstrip('/')
+
+        # 1. Convert share URLs: /share/reel/XYZ -> /reel/XYZ/ or /share/p/XYZ -> /p/XYZ/
+        share_match = re.search(r'/share/(?:reel|p)/([a-zA-Z0-9_-]+)', path)
+        if share_match:
+            shortcode = share_match.group(1)
+            path = f"/reel/{shortcode}"
+        elif path.startswith('/share/'):
+            # Generic /share/ID or shortlink redirect
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    redirected = resp.geturl()
+                    if redirected and redirected != url and 'instagram.com' in redirected:
+                        return normalize_instagram_url(redirected)
+            except Exception:
+                pass
+
+        # 2. Convert /reels/ to /reel/
+        if path.startswith('/reels/'):
+            path = '/reel/' + path[7:]
+
+        # 3. Strip tracking parameters (?igsh=..., utm_*, etc.)
+        qs = parse_qs(parsed.query)
+        filtered_qs = {
+            k: v for k, v in qs.items()
+            if not (k.startswith('utm_') or k in ['igsh', 'ig_mid', 'src', 'fbclid', 'ig_rid'])
+        }
+        from urllib.parse import urlencode
+        clean_query = urlencode(filtered_qs, doseq=True) if filtered_qs else ""
+
+        netloc = 'www.instagram.com' if any(d in parsed.netloc.lower() for d in ['instagr.am', 'instagram.com', 'ig.me']) else parsed.netloc
+        normalized = f"{parsed.scheme or 'https'}://{netloc}{path}/"
+        if clean_query:
+            normalized += f"?{clean_query}"
+        return normalized
+    except Exception:
+        return url
+
+
 def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
-    """Sets up cookies from environment variable if present, or checks existing file."""
-    cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("COOKIES_CONTENT")
+    """
+    Sets up cookies from environment variable if present, or checks existing file.
+    Supports YOUTUBE_COOKIES, COOKIES_CONTENT, INSTAGRAM_COOKIES, and INSTAGRAM_SESSIONID.
+    """
+    cookies_env = (
+        os.getenv("COOKIES_CONTENT")
+        or os.getenv("YOUTUBE_COOKIES")
+        or os.getenv("INSTAGRAM_COOKIES")
+    )
+    ig_sessionid = os.getenv("INSTAGRAM_SESSIONID") or os.getenv("IG_SESSIONID")
+
+    lines = []
     if cookies_env and cookies_env.strip():
+        lines.append(cookies_env.strip())
+
+    if ig_sessionid and ig_sessionid.strip():
+        sid = ig_sessionid.strip()
+        lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sid}")
+
+    if lines:
         try:
             with open(cookies_path, "w", encoding="utf-8") as f:
-                f.write(cookies_env.strip() + "\n")
+                header = "# Netscape HTTP Cookie File\n" if not any(l.startswith("#") for l in lines) else ""
+                f.write(header + "\n".join(lines) + "\n")
             return cookies_path
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error escribiendo archivo de cookies: {e}")
 
     if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
         return cookies_path
@@ -353,6 +421,9 @@ class VideoDownloader:
         platform_name, platform_emoji = detect_platform(url)
         is_yt = is_youtube_url(url)
 
+        if platform_name == "Instagram":
+            url = normalize_instagram_url(url)
+
         ydl_opts: Dict[str, Any] = {
             'outtmpl': output_template,
             'writethumbnail': True,
@@ -435,10 +506,27 @@ class VideoDownloader:
                     "YouTube ha bloqueado temporalmente las descargas para la IP del servidor en la nube (Render). "
                     "Para solucionarlo de inmediato, añade tus cookies en la variable de entorno YOUTUBE_COOKIES en Render."
                 )
+            if platform_name == "Instagram" and ('empty media response' in err_text or 'login' in err_text.lower() or 'checkpoint' in err_text.lower()):
+                raise ValueError(
+                    "Instagram requiere autenticación para procesar este video. "
+                    "Añade tu cookie de sesión de Instagram configurando INSTAGRAM_SESSIONID=tu_session_id en el archivo .env."
+                )
             raise ValueError(f"Error al descargar: {err_text}")
 
         if 'entries' in info and info['entries']:
-            info = info['entries'][0]
+            # Prioritize video entries in carousel posts
+            video_entries = [
+                e for e in info['entries']
+                if e and (
+                    e.get('vcodec') not in (None, 'none')
+                    or e.get('ext') in ['mp4', 'mov', 'mkv', 'webm']
+                    or e.get('video_ext') not in (None, 'none')
+                )
+            ]
+            if video_entries:
+                info = video_entries[0]
+            else:
+                info = info['entries'][0]
 
         title = info.get('title', 'Video')
         uploader = info.get('uploader') or info.get('channel') or platform_name

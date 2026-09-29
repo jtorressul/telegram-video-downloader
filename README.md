@@ -51,16 +51,20 @@ Cada usuario puede consultar sus estadísticas en tiempo real enviando `/stats` 
    - `/unvip [user_id]`: Quita el rango VIP.
 6. **Caché Ultra Rápida (SQLite):**
    - Si un archivo ya fue descargado previamente, se entrega en menos de **0.5 segundos**.
-7. **Listo para la Nube (Render / Koyeb):**
-   - Incluye microservidor web interno en `$PORT` y `Dockerfile` para funcionar 24/7.
+7. **Reinicio de Cuotas a las 12:00 AM (Hora Local):**
+   - Tarea programada en segundo plano que reinicia automáticamente las cuotas diarias a las 00:00:00 (12:00 AM) hora local todos los días (configurable con `TIMEZONE` en `.env`).
+8. **Compatibilidad Total con Instagram:**
+   - Soporta enlaces de Reels, Posts, Carruseles (prioriza videos), enlaces compartidos desde la app (`/share/reel/`, etc.) y autenticación con `INSTAGRAM_SESSIONID` para descargar sin restricciones.
 
 ---
 
 ## 🛠️ Configuración y Ejecución
 
 ```bash
-# 1. Configura tu token en .env
+# 1. Configura tu token y variables opcionales en .env
 TELEGRAM_BOT_TOKEN=tu_token_aqui
+INSTAGRAM_SESSIONID=tu_session_id_aqui  # Opcional para desbloquear cualquier video de IG
+TIMEZONE=America/New_York                # Opcional (por defecto usa la hora de la máquina)
 
 # 2. Inicia el bot
 ./run.sh

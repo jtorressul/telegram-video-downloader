@@ -14,6 +14,23 @@ VIP_DAILY_LIMIT = 15
 SOCIAL_PLATFORMS = {"Instagram", "TikTok", "X (Twitter)"}
 
 
+def get_local_now() -> datetime:
+    """Returns the current datetime in the local timezone (respecting TIMEZONE/TZ env vars)."""
+    tz_name = os.getenv("TIMEZONE") or os.getenv("TZ")
+    if tz_name:
+        try:
+            import zoneinfo
+            return datetime.now(zoneinfo.ZoneInfo(tz_name.strip()))
+        except Exception as e:
+            logger.warning(f"Error loading timezone '{tz_name}': {e}. Using system local timezone.")
+    return datetime.now().astimezone()
+
+
+def get_local_today_str() -> str:
+    """Returns today's date formatted as YYYY-MM-DD in the local timezone."""
+    return get_local_now().date().isoformat()
+
+
 class UserDatabase:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
@@ -67,9 +84,23 @@ class UserDatabase:
             cur.execute("SELECT group_id FROM known_groups")
             return [row[0] for row in cur.fetchall()]
 
+    def reset_all_daily_quotas(self) -> int:
+        """
+        Resets daily download counters to 0 for all users at 12:00 AM local time.
+        Returns the number of user records updated.
+        """
+        today_str = get_local_today_str()
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET daily_downloads = 0, last_download_date = ?", (today_str,))
+            conn.commit()
+            count = cur.rowcount
+            logger.info(f"Reinicio de cuotas medianoche ejecutado para {count} usuarios (Fecha local: {today_str})")
+            return count
+
     def get_or_create_user(self, user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Dict[str, Any]:
         """Fetches or registers a user, handling daily quota resets."""
-        today_str = date.today().isoformat()
+        today_str = get_local_today_str()
 
         with self._get_connection() as conn:
             cur = conn.cursor()
@@ -95,7 +126,7 @@ class UserDatabase:
                     updates.append("first_name = ?")
                     params.append(first_name)
 
-                # Daily quota reset if date changed
+                # Daily quota reset if date changed (12:00 AM boundary)
                 if row['last_download_date'] != today_str:
                     updates.append("daily_downloads = 0")
                     updates.append("last_download_date = ?")
@@ -125,7 +156,10 @@ class UserDatabase:
         """
         user = self.get_or_create_user(user_id)
         is_vip = bool(user.get('is_vip', 0))
+        today_str = get_local_today_str()
         daily_used = user.get('daily_downloads', 0)
+        if user.get('last_download_date') != today_str:
+            daily_used = 0
 
         # 1. Platform check: NO VIP only allowed X, Instagram, TikTok
         if not is_vip and platform not in SOCIAL_PLATFORMS:
@@ -140,7 +174,7 @@ class UserDatabase:
 
     def record_download_success(self, user_id: int, platform: str):
         """Increments download stats and daily quota."""
-        today_str = date.today().isoformat()
+        today_str = get_local_today_str()
         is_social = 1 if platform in SOCIAL_PLATFORMS else 0
 
         with self._get_connection() as conn:
@@ -175,7 +209,7 @@ class UserDatabase:
         total = user.get('total_downloads', 0)
         social = user.get('social_downloads', 0)
         other = user.get('other_downloads', 0)
-        today_str = date.today().isoformat()
+        today_str = get_local_today_str()
         daily = user.get('daily_downloads', 0)
         if user.get('last_download_date') != today_str:
             daily = 0

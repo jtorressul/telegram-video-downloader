@@ -28,9 +28,16 @@ from downloader import (
     extract_youtube_id,
     is_youtube_url,
     is_spotify_url,
+    normalize_instagram_url,
 )
 from cache import VideoCache
-from db import UserDatabase, NO_VIP_DAILY_LIMIT, VIP_DAILY_LIMIT
+from db import (
+    UserDatabase,
+    NO_VIP_DAILY_LIMIT,
+    VIP_DAILY_LIMIT,
+    get_local_now,
+    get_local_today_str,
+)
 
 # Load environment variables
 load_dotenv()
@@ -89,11 +96,39 @@ def format_filesize(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
+async def schedule_midnight_quota_reset():
+    """Background loop that resets all user daily quotas exactly at 12:00 AM (midnight) local time."""
+    import datetime as dt
+    while True:
+        try:
+            now = get_local_now()
+            # Calculate next midnight (00:00:00) in local timezone
+            tomorrow = now.date() + dt.timedelta(days=1)
+            next_midnight = dt.datetime.combine(tomorrow, dt.time.min, tzinfo=now.tzinfo)
+            wait_seconds = (next_midnight - now).total_seconds()
+            logger.info(
+                f"⏰ Próximo reinicio de cuotas programado para las 12:00 AM hora local "
+                f"({next_midnight.strftime('%Y-%m-%d %H:%M:%S %Z')}), esperando {wait_seconds:.1f}s."
+            )
+            await asyncio.sleep(max(1.0, wait_seconds))
+            # Sleep 2 extra seconds to ensure date rollover is complete
+            await asyncio.sleep(2.0)
+
+            count = user_db.reset_all_daily_quotas()
+            logger.info(f"✅ Reinicio automático de medianoche completado: {count} usuarios reiniciados.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error en la tarea de reinicio a las 12:00 AM: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+
 async def post_init(application: Application) -> None:
-    """Called after application initializes to fetch and cache bot username."""
+    """Called after application initializes to fetch bot username and start background scheduler."""
     bot_info = await application.bot.get_me()
     application.bot_data['username'] = bot_info.username
     logger.info(f"Bot iniciado exitosamente como @{bot_info.username}")
+    asyncio.create_task(schedule_midnight_quota_reset())
 
 
 async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -479,6 +514,8 @@ async def execute_download(
         yt_id = extract_youtube_id(url)
         if yt_id:
             url = f"https://www.youtube.com/watch?v={yt_id}"
+    elif platform == "Instagram":
+        url = normalize_instagram_url(url)
     clean_url = html.escape(url)
 
     # 1. Quota & Permission Verification (Enforced both in private and groups)
