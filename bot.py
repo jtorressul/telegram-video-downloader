@@ -27,6 +27,7 @@ from downloader import (
     format_duration,
     extract_youtube_id,
     is_youtube_url,
+    is_spotify_url,
 )
 from cache import VideoCache
 from db import UserDatabase, NO_VIP_DAILY_LIMIT, VIP_DAILY_LIMIT
@@ -469,6 +470,9 @@ async def execute_download(
     """Core download execution with quota checking, caching, and stats recording."""
     platform, emoji = detect_platform(url)
     is_yt = is_youtube_url(url)
+    is_spotify = is_spotify_url(url)
+    if is_spotify:
+        format_type = "mp3"
     format_type = format_type.lower().strip()
     is_audio = (format_type == 'mp3')
     clean_url = html.escape(url)
@@ -919,6 +923,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = urls[0].strip()
     platform, emoji = detect_platform(url)
     is_yt = is_youtube_url(url)
+    is_spotify = is_spotify_url(url)
     user_mention = user.mention_html() if user else "Usuario"
 
     # If YouTube, offer MP3 vs MP4 selector
@@ -932,14 +937,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # For other platforms (Instagram, TikTok, X, Facebook): start MP4 download directly
+    # Spotify defaults to MP3 audio, others to MP4 video
+    forced_format = "mp3" if is_spotify else "mp4"
+
+    # For other platforms (Instagram, TikTok, X, Facebook, Spotify): start download directly
     await execute_download(
         context=context,
         chat_id=chat.id,
         user_id=user.id,
         user_mention=user_mention,
         url=url,
-        format_type="mp4",
+        format_type=forced_format,
         status_message=None,
         original_message=update.message,
         is_group=is_group,

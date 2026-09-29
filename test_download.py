@@ -1,29 +1,33 @@
 import os
 import sys
 import asyncio
-from downloader import VideoDownloader, detect_platform, format_duration, is_youtube_url
+from downloader import VideoDownloader, detect_platform, format_duration, is_youtube_url, is_spotify_url
 
 async def main():
     print("=" * 60)
-    print("🧪 PRUEBA LOCAL: YOUTUBE & YOUTUBE MUSIC (MP3 / MP4)")
+    print("🧪 PRUEBA LOCAL: YOUTUBE, YOUTUBE MUSIC & SPOTIFY (MP3 / MP4)")
     print("=" * 60)
 
     # URL
     if len(sys.argv) > 1:
         url = sys.argv[1].strip()
     else:
-        url = input("👉 Pega la URL de YouTube o YouTube Music: ").strip()
+        url = input("👉 Pega la URL (YouTube, YouTube Music o Spotify): ").strip()
 
     if not url:
         print("❌ No ingresaste ninguna URL.")
         return
 
-    if not is_youtube_url(url):
-        print("❌ La URL no parece pertenecer a YouTube o YouTube Music.")
+    if not is_youtube_url(url) and not is_spotify_url(url):
+        print("❌ La URL no parece pertenecer a YouTube, YouTube Music o Spotify.")
         return
 
+    platform, emoji = detect_platform(url)
+
     # Format
-    if len(sys.argv) > 2:
+    if is_spotify_url(url):
+        fmt = "mp3"
+    elif len(sys.argv) > 2:
         fmt = sys.argv[2].strip().lower()
     else:
         fmt_choice = input("👉 Elige formato (1: MP3 Audio, 2: MP4 Video) [default: 1]: ").strip()
