@@ -183,8 +183,8 @@ def compress_video_ffmpeg(input_file: str, output_file: str, duration: float) ->
         return False
 
     total_bitrate = int((TARGET_COMPRESSION_BYTES * 8) / duration)
-    audio_bitrate = 128 * 1000
-    video_bitrate = max(total_bitrate - audio_bitrate, 150 * 1000)
+    audio_bitrate = 96 * 1000 if duration > 600 else 128 * 1000
+    video_bitrate = max(total_bitrate - audio_bitrate, 100 * 1000)
 
     try:
         cmd = [
@@ -195,7 +195,7 @@ def compress_video_ffmpeg(input_file: str, output_file: str, duration: float) ->
             '-bufsize', str(int(video_bitrate * 2)),
             '-preset', 'veryfast',
             '-c:a', 'aac',
-            '-b:a', '128k',
+            '-b:a', '96k' if duration > 600 else '128k',
             '-movflags', '+faststart',
             output_file
         ]
@@ -207,6 +207,107 @@ def compress_video_ffmpeg(input_file: str, output_file: str, duration: float) ->
         pass
 
     return False
+
+
+def download_tiktok_via_api(url: str, format_type: str, temp_subfolder: str) -> Dict[str, Any]:
+    """Downloads TikTok video or audio directly via TikWM API when yt-dlp is IP blocked."""
+    import urllib.parse
+    api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}"
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/124.0.0.0 Safari/537.36'
+        )
+    }
+    req = urllib.request.Request(api_url, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+
+    if data.get('code') != 0:
+        msg = data.get('msg', 'Error desconocido en TikTok API')
+        raise ValueError(f"No se pudo descargar el video de TikTok: {msg}")
+
+    item = data.get('data', {})
+    title = item.get('title') or "Video de TikTok"
+    author = item.get('author', {}).get('nickname') or item.get('author', {}).get('unique_id') or "TikTok"
+    duration = item.get('duration') or 0
+    cover_url = item.get('cover')
+
+    if format_type == 'mp3':
+        music_url = item.get('music') or item.get('play')
+        if not music_url:
+            raise ValueError("No se encontró el audio de este TikTok.")
+        raw_audio = os.path.join(temp_subfolder, "tiktok_audio_raw")
+        urllib.request.urlretrieve(music_url, raw_audio)
+        mp3_file = os.path.join(temp_subfolder, f"{item.get('id', 'tiktok_audio')}.mp3")
+        cmd = ['ffmpeg', '-y', '-i', raw_audio, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', mp3_file]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        final_file = mp3_file if (os.path.exists(mp3_file) and os.path.getsize(mp3_file) > 0) else raw_audio
+        thumb_file = None
+        if cover_url:
+            raw_cov = os.path.join(temp_subfolder, "tiktok_cover.jpg")
+            try:
+                urllib.request.urlretrieve(cover_url, raw_cov)
+                thumb_file = convert_thumbnail_to_jpg(raw_cov, "", temp_subfolder)
+            except Exception:
+                pass
+        return {
+            'file_path': final_file,
+            'thumbnail_path': thumb_file,
+            'title': title,
+            'artist': author,
+            'duration': int(duration) if duration else None,
+            'width': None,
+            'height': None,
+            'filesize': os.path.getsize(final_file),
+            'platform': 'TikTok',
+            'platform_emoji': '🎵',
+            'is_audio': True,
+            'format': 'mp3',
+        }
+
+    # Video MP4
+    play_url = item.get('play') or item.get('wmplay')
+    if not play_url:
+        raise ValueError("No se encontró el video de este TikTok.")
+
+    dest_video = os.path.join(temp_subfolder, f"{item.get('id', 'tiktok_video')}.mp4")
+    urllib.request.urlretrieve(play_url, dest_video)
+
+    thumb_file = None
+    if cover_url:
+        raw_cov = os.path.join(temp_subfolder, "tiktok_cover.jpg")
+        try:
+            urllib.request.urlretrieve(cover_url, raw_cov)
+            thumb_file = convert_thumbnail_to_jpg(raw_cov, dest_video, temp_subfolder)
+        except Exception:
+            pass
+
+    if not thumb_file:
+        thumb_file = convert_thumbnail_to_jpg(None, dest_video, temp_subfolder)
+
+    file_size = os.path.getsize(dest_video)
+    if file_size > MAX_TELEGRAM_SIZE_BYTES and duration and 0 < duration < 1800:
+        compressed_path = os.path.join(temp_subfolder, 'compressed_video.mp4')
+        if compress_video_ffmpeg(dest_video, compressed_path, float(duration)):
+            dest_video = compressed_path
+            file_size = os.path.getsize(dest_video)
+
+    return {
+        'file_path': dest_video,
+        'thumbnail_path': thumb_file,
+        'title': title,
+        'artist': author,
+        'duration': int(duration) if duration else None,
+        'width': None,
+        'height': None,
+        'filesize': file_size,
+        'platform': 'TikTok',
+        'platform_emoji': '🎵',
+        'is_audio': False,
+        'format': 'mp4',
+    }
 
 
 def normalize_instagram_url(url: str) -> str:
@@ -261,7 +362,8 @@ def normalize_instagram_url(url: str) -> str:
 
 def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
     """
-    Sets up cookies from environment variable if present, or checks existing file.
+    Sets up cookies from environment variable if present, or checks existing file,
+    or automatically exports relevant cookies from installed local browsers (Firefox, Chrome, etc.).
     Supports YOUTUBE_COOKIES, COOKIES_CONTENT, INSTAGRAM_COOKIES, and INSTAGRAM_SESSIONID.
     """
     cookies_env = (
@@ -290,15 +392,58 @@ def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
 
     if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
         return cookies_path
+
+    # Try automatic extraction from local browsers
+    for browser in ['firefox', 'chrome', 'brave', 'chromium', 'edge']:
+        try:
+            ydl_test = yt_dlp.YoutubeDL({'cookiesfrombrowser': (browser, None, None, None), 'quiet': True})
+            if ydl_test.cookiejar and len(ydl_test.cookiejar) > 0:
+                with open(cookies_path, "w", encoding="utf-8") as f:
+                    f.write("# Netscape HTTP Cookie File\n")
+                    for c in ydl_test.cookiejar:
+                        if any(d in c.domain for d in ['youtube.com', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'facebook.com', 'spotify.com']):
+                            initial_dot = "TRUE" if c.domain.startswith(".") else "FALSE"
+                            secure = "TRUE" if c.secure else "FALSE"
+                            expires = str(c.expires) if c.expires else "0"
+                            f.write(f"{c.domain}\t{initial_dot}\t{c.path}\t{secure}\t{expires}\t{c.name}\t{c.value}\n")
+                if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+                    logger.info(f"Cookies exportadas exitosamente desde {browser} a {cookies_path}")
+                    return cookies_path
+        except Exception:
+            continue
+
     return None
 
 
 def get_js_runtimes_config() -> Optional[Dict[str, Any]]:
     """Detects available JS runtime (node/deno) for yt-dlp challenge solving."""
     node_path = shutil.which("node") or shutil.which("nodejs")
+    if not node_path:
+        nvm_patterns = [
+            os.path.expanduser("~/.nvm/versions/node/*/bin/node"),
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+            "/usr/bin/nodejs",
+            os.path.expanduser("~/.local/bin/node"),
+        ]
+        for pattern in nvm_patterns:
+            matches = glob.glob(pattern)
+            if matches:
+                matches.sort()
+                found = matches[-1]
+                if os.path.isfile(found) and os.access(found, os.X_OK):
+                    node_path = found
+                    break
+
     if node_path:
         return {'node': {'path': node_path}}
+
     deno_path = shutil.which("deno")
+    if not deno_path:
+        for p in [os.path.expanduser("~/.deno/bin/deno"), "/usr/local/bin/deno", "/usr/bin/deno"]:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                deno_path = p
+                break
     if deno_path:
         return {'deno': {'path': deno_path}}
     return None
@@ -430,7 +575,7 @@ class VideoDownloader:
             'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
-            'max_filesize': MAX_TELEGRAM_SIZE_BYTES,
+            'max_filesize': 120 * 1024 * 1024,
             'concurrent_fragment_downloads': 8,
             'socket_timeout': 15,
             'http_chunk_size': 10485760,
@@ -464,40 +609,54 @@ class VideoDownloader:
             }]
         else:
             ydl_opts['format'] = (
-                'bestvideo[ext=mp4][vcodec^=avc1][filesize<48M]+bestaudio[ext=m4a]/'
-                'bestvideo[filesize<45M]+bestaudio[filesize<5M]/'
-                'best[filesize<49M][ext=mp4]/'
-                'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+                'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/'
+                'bestvideo[height<=720]+bestaudio/'
+                'best[height<=720][ext=mp4]/'
+                'best[height<=720]/'
+                'bestvideo+bestaudio/best'
             )
             ydl_opts['merge_output_format'] = 'mp4'
 
         if self.cookies_file:
             ydl_opts['cookiefile'] = self.cookies_file
 
-        # Execution with sequential client fallbacks for YouTube
-        clients_to_try = [['android'], None, ['web_safari'], ['mweb']] if is_yt else [None]
-        info = None
-        active_ydl = None
-        last_error = None
-
-        for client in clients_to_try:
-            attempt_opts = dict(ydl_opts)
-            if client:
-                attempt_opts['extractor_args'] = {'youtube': {'player_client': client}}
+        # TikTok special handling: try yt-dlp first; if blocked, fallback to TikWM API directly
+        if platform_name == "TikTok":
             try:
-                active_ydl = yt_dlp.YoutubeDL(attempt_opts)
+                active_ydl = yt_dlp.YoutubeDL(ydl_opts)
                 info = active_ydl.extract_info(url, download=True)
-                if info:
-                    break
-            except Exception as e:
-                last_error = e
-                err_msg = str(e)
-                logger.warning(f"Download attempt with client {client} failed: {err_msg}")
-                if 'Private video' in err_msg or 'This video is private' in err_msg:
-                    raise ValueError("El video es privado o no está disponible.")
-                elif 'Video unavailable' in err_msg:
-                    raise ValueError("El video no está disponible o fue eliminado.")
-                continue
+            except Exception as e_tt:
+                logger.warning(f"yt-dlp falló para TikTok ({e_tt}), ejecutando descarga via TikWM API...")
+                try:
+                    return download_tiktok_via_api(url, format_type, temp_subfolder)
+                except Exception as e_fallback:
+                    logger.error(f"TikWM fallback también falló: {e_fallback}")
+                    raise ValueError(f"No se pudo descargar el video de TikTok: {e_tt}")
+        else:
+            # Execution with sequential client fallbacks for YouTube (None/default first with JS runtime)
+            clients_to_try = [None, ['ios'], ['web_safari'], ['mweb'], ['android']] if is_yt else [None]
+            info = None
+            active_ydl = None
+            last_error = None
+
+            for client in clients_to_try:
+                attempt_opts = dict(ydl_opts)
+                if client:
+                    attempt_opts['extractor_args'] = {'youtube': {'player_client': client}}
+                try:
+                    active_ydl = yt_dlp.YoutubeDL(attempt_opts)
+                    info = active_ydl.extract_info(url, download=True)
+                    if info:
+                        break
+                except Exception as e:
+                    last_error = e
+                    err_msg = str(e)
+                    logger.warning(f"Download attempt with client {client} failed: {err_msg}")
+                    if 'Private video' in err_msg or 'This video is private' in err_msg:
+                        raise ValueError("El video es privado o no está disponible.")
+                    elif 'Video unavailable' in err_msg:
+                        raise ValueError("El video no está disponible o fue eliminado.")
+                    continue
 
         if not info:
             err_text = str(last_error or "Error desconocido")
@@ -579,7 +738,7 @@ class VideoDownloader:
 
         # Compress video if slightly over 50MB
         if format_type == 'mp4' and file_size > MAX_TELEGRAM_SIZE_BYTES:
-            if duration and 0 < duration < 900:
+            if duration and 0 < duration < 1800:
                 compressed_path = os.path.join(temp_subfolder, 'compressed_video.mp4')
                 if compress_video_ffmpeg(result_file, compressed_path, float(duration)):
                     result_file = compressed_path

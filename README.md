@@ -8,8 +8,8 @@ Bot de Telegram desarrollado en Python para descargar videos y música en alta c
 
 | Rango | Estado en `/stats` | Cuota Diaria | Plataformas Permitidas |
 | :--- | :--- | :--- | :--- |
-| 🆓 **NO VIP** | `NO VIP PASS` | **10 descargas / día** | 📸 **Instagram**, 🎵 **TikTok**, 🐦 **X (Twitter)** |
-| 👑 **VIP** | `VIP` | **20 descargas / día** | 🌐 **Todas** (▶️ YouTube MP3/MP4, 🟢 Spotify MP3, 👥 Facebook, IG, TikTok, X) |
+| 🆓 **NO VIP** | `NO VIP PASS` | **5 descargas / día** | 📸 **Instagram**, 🎵 **TikTok**, 🐦 **X (Twitter)** |
+| 👑 **VIP** | `VIP` | **15 descargas / día** | 🌐 **Todas** (▶️ YouTube MP3/MP4, 🟢 Spotify MP3, 👥 Facebook, IG, TikTok, X) |
 
 ### 🔍 Detección Automática de VIP en Grupos:
 El bot detecta automáticamente a los miembros VIP si su **Título Personalizado (Custom Title)** en el grupo de Telegram contiene la palabra **`VIP`** (por ejemplo: `DROGUITA - VIP`, `SIN SOMBRA - VIP`, `ALFREDO PC - VIP`), o si son los creadores del grupo. ¡Cero configuración manual requerida!
@@ -26,7 +26,7 @@ Cada usuario puede consultar sus estadísticas en tiempo real enviando `/stats` 
 💎 Estado: VIP (o NO VIP PASS)
 📥 Descargas: 14
 📱 Social: 10 | 🌐 Otras: 4
-🗓 Cuota diaria: 14/20 (o 7/10 si es NO VIP)
+🗓 Cuota diaria: 14/15 (o 3/5 si es NO VIP)
 ```
 
 - **Social:** Contador de descargas de Instagram, TikTok y X.
@@ -45,7 +45,7 @@ Cada usuario puede consultar sus estadísticas en tiempo real enviando `/stats` 
    - Si el bot tiene permisos de Administrador (*Eliminar mensajes*), borra automáticamente el enlace original del chat una vez enviado el video/música.
 4. **Control de Restricciones:**
    - Si un usuario `NO VIP PASS` intenta descargar de YouTube, Spotify o Facebook, el bot le informa que esas plataformas son exclusivas para miembros VIP.
-   - Si se supera el límite diario (10 o 20 descargas), notifica el reinicio a las 00:00.
+   - Si se supera el límite diario (5 o 15 descargas), notifica el reinicio a las 00:00.
 5. **Comandos de Administración:**
    - `/vip [user_id]` (o respondiendo a un usuario): Activa manualmente el rango VIP.
    - `/unvip [user_id]`: Quita el rango VIP.
