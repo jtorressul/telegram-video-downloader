@@ -8,7 +8,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
 from telegram.constants import ChatAction, ChatType, ParseMode, ChatMemberStatus
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -562,7 +568,22 @@ async def execute_download(
             performer = cached_data.get('performer')
             clean_performer = html.escape(performer or '')
 
-            if is_audio:
+            if cached_data.get('media_type') == 'photo':
+                caption = (
+                    f"📸 <b>{clean_title}</b>\n\n"
+                    f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
+                    f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
+                    f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                    f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
+                    f"⚡ <i>Descarga instantánea</i>"
+                )
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=cached_data['file_id'],
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            elif is_audio or cached_data.get('media_type') == 'audio':
                 caption = (
                     f"🎵 <b>{clean_title}</b>\n"
                     + (f"🎤 <b>Canal/Artista:</b> {clean_performer}\n" if clean_performer else "")
@@ -620,7 +641,7 @@ async def execute_download(
             logger.info(f"Cached delivery failed, downloading fresh: {e}")
 
     # 3. Fresh download
-    item_label = "audio MP3" if is_audio else "video"
+    item_label = "audio MP3" if is_audio else "contenido"
     if status_message:
         try:
             await status_message.edit_text(
@@ -655,8 +676,10 @@ async def execute_download(
         except Exception:
             pass
 
-        file_path = download_result['file_path']
-        thumb_path = download_result.get('thumbnail_path')
+        res_type = download_result.get('type')
+        if not res_type:
+            res_type = 'audio' if download_result.get('is_audio') else 'video'
+
         title = download_result.get('title', 'Media')
         duration = download_result.get('duration')
         width = download_result.get('width')
@@ -666,7 +689,9 @@ async def execute_download(
         clean_title = html.escape(title[:200] + ('...' if len(title) > 200 else ''))
         clean_artist = html.escape(artist or '')
 
-        if is_audio:
+        if res_type == 'audio':
+            file_path = download_result['file_path']
+            thumb_path = download_result.get('thumbnail_path')
             caption = (
                 f"🎵 <b>{clean_title}</b>\n"
                 + (f"🎤 <b>Canal/Artista:</b> {clean_artist}\n" if clean_artist else "")
@@ -704,11 +729,101 @@ async def execute_download(
                             filesize=filesize,
                             is_audio=True,
                             performer=artist,
+                            media_type='audio',
                         )
                 finally:
                     if thumb_fp:
                         thumb_fp.close()
+
+        elif res_type == 'photo':
+            file_path = download_result['file_path']
+            caption = (
+                f"📸 <b>{clean_title}</b>\n\n"
+                f"{emoji} <b>Plataforma:</b> {platform}\n"
+                f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
+                f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                f"🔗 <a href=\"{clean_url}\">Link original</a>"
+            )
+            with open(file_path, 'rb') as photo_fp:
+                sent_msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_fp,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    read_timeout=300,
+                    write_timeout=300,
+                )
+                if sent_msg and sent_msg.photo:
+                    cache.set(
+                        video_id_or_url=cache_key,
+                        format_type=format_type,
+                        file_id=sent_msg.photo[-1].file_id,
+                        title=title,
+                        platform=platform,
+                        duration=None,
+                        width=width,
+                        height=height,
+                        filesize=filesize,
+                        is_audio=False,
+                        media_type='photo',
+                    )
+
+        elif res_type == 'album':
+            caption = (
+                f"📸 <b>{clean_title}</b>\n\n"
+                f"{emoji} <b>Plataforma:</b> {platform}\n"
+                f"📦 <b>Tamaño total:</b> {format_filesize(filesize)}\n"
+                f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                f"🔗 <a href=\"{clean_url}\">Link original</a>"
+            )
+            open_files = []
+            media_group = []
+            media_items = download_result.get('media_items', [])
+            for idx, item in enumerate(media_items[:10]):
+                item_fp = open(item['file_path'], 'rb')
+                open_files.append(item_fp)
+                item_caption = caption if idx == 0 else None
+                if item.get('type') == 'video':
+                    t_p = item.get('thumbnail_path')
+                    t_fp = open(t_p, 'rb') if (t_p and os.path.exists(t_p)) else None
+                    if t_fp:
+                        open_files.append(t_fp)
+                    media_group.append(
+                        InputMediaVideo(
+                            media=item_fp,
+                            thumbnail=t_fp,
+                            caption=item_caption,
+                            parse_mode=ParseMode.HTML if item_caption else None,
+                            supports_streaming=True
+                        )
+                    )
+                else:
+                    media_group.append(
+                        InputMediaPhoto(
+                            media=item_fp,
+                            caption=item_caption,
+                            parse_mode=ParseMode.HTML if item_caption else None
+                        )
+                    )
+
+            try:
+                await context.bot.send_media_group(
+                    chat_id=chat_id,
+                    media=media_group,
+                    read_timeout=300,
+                    write_timeout=300,
+                )
+            finally:
+                for fp in open_files:
+                    try:
+                        fp.close()
+                    except Exception:
+                        pass
+
         else:
+            # Video
+            file_path = download_result['file_path']
+            thumb_path = download_result.get('thumbnail_path')
             caption = (
                 f"🎬 <b>{clean_title}</b>\n\n"
                 f"{emoji} <b>Plataforma:</b> {platform}\n"
@@ -745,6 +860,7 @@ async def execute_download(
                             height=height,
                             filesize=filesize,
                             is_audio=False,
+                            media_type='video',
                         )
                 finally:
                     if thumb_fp:

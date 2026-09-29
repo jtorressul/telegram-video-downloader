@@ -53,6 +53,7 @@ class VideoCache:
                     filesize INTEGER,
                     is_audio INTEGER DEFAULT 0,
                     performer TEXT,
+                    media_type TEXT DEFAULT 'video',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -62,6 +63,10 @@ class VideoCache:
                 pass
             try:
                 conn.execute("ALTER TABLE video_cache ADD COLUMN performer TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE video_cache ADD COLUMN media_type TEXT DEFAULT 'video'")
             except Exception:
                 pass
             conn.commit()
@@ -81,7 +86,7 @@ class VideoCache:
             with self._get_connection() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT file_id, title, platform, duration, width, height, filesize, is_audio, performer FROM video_cache WHERE url_key = ?",
+                    "SELECT file_id, title, platform, duration, width, height, filesize, is_audio, performer, media_type FROM video_cache WHERE url_key = ?",
                     (key,)
                 )
                 row = cur.fetchone()
@@ -91,15 +96,29 @@ class VideoCache:
             logger.warning(f"Error reading cache for {video_id_or_url}: {e}")
         return None
 
-    def set(self, video_id_or_url: str, format_type: str, file_id: str, title: str, platform: str, duration: Optional[int], width: Optional[int], height: Optional[int], filesize: int, is_audio: bool = False, performer: Optional[str] = None):
-        """Saves Telegram file_id and metadata for a video/audio in specific format."""
+    def set(
+        self,
+        video_id_or_url: str,
+        format_type: str,
+        file_id: str,
+        title: str,
+        platform: str,
+        duration: Optional[int],
+        width: Optional[int],
+        height: Optional[int],
+        filesize: int,
+        is_audio: bool = False,
+        performer: Optional[str] = None,
+        media_type: str = "video",
+    ):
+        """Saves Telegram file_id and metadata for media in specific format."""
         key = self._make_key(video_id_or_url, format_type)
         try:
             with self._get_connection() as conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO video_cache (url_key, file_id, title, platform, duration, width, height, filesize, is_audio, performer)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (key, file_id, title, platform, duration, width, height, filesize, 1 if is_audio else 0, performer))
+                    INSERT OR REPLACE INTO video_cache (url_key, file_id, title, platform, duration, width, height, filesize, is_audio, performer, media_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (key, file_id, title, platform, duration, width, height, filesize, 1 if is_audio else 0, performer, media_type))
                 conn.commit()
         except Exception as e:
             logger.warning(f"Error saving to cache for {video_id_or_url}: {e}")
