@@ -21,10 +21,16 @@ from telegram.ext import (
     filters,
 )
 
-from downloader import VideoDownloader, detect_platform, format_duration
+from downloader import (
+    VideoDownloader,
+    detect_platform,
+    format_duration,
+    extract_youtube_id,
+    is_youtube_url,
+)
 from cache import VideoCache
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Configure logging
@@ -38,29 +44,28 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip()
 
-# Initialize video downloader and cache
+# Initialize downloader and cache
 downloader = VideoDownloader(cookies_file=COOKIES_FILE if os.path.exists(COOKIES_FILE) else None)
 cache = VideoCache()
 
-# Concurrency limiter (allows up to 4 parallel downloads)
+# Concurrency limiter
 download_semaphore = asyncio.Semaphore(4)
 
 URL_REGEX = re.compile(
-    r'(https?://(?:www\.|(?!www))[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|'
-    r'https?://[a-zA-Z0-9]+\.[^\s]{2,})'
+    r'(https?://(?:www\.|m\.|music\.)?(?:youtube\.com/[^\s]+|youtu\.be/[a-zA-Z0-9_-]{11}[^\s]*))'
 )
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler to satisfy cloud health checks (like Render Web Service)."""
+    """Simple HTTP handler to satisfy cloud health checks (Render / Koyeb)."""
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Bot de Telegram activo y funcionando.")
+        self.wfile.write(b"OK - YouTube & YouTube Music Bot activo.")
 
     def log_message(self, format, *args):
-        pass  # Silence access logs
+        pass
 
 
 def start_health_server():
@@ -118,9 +123,6 @@ async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def get_start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
     """Creates the main interactive keyboard with direct Add to Group buttons."""
-    # Deep links for adding the bot to a group:
-    # 1. With admin rights (delete_messages) for auto-cleaning links
-    # 2. As standard member
     add_group_admin_url = (
         f"https://t.me/{bot_username}?startgroup=botstart&admin=delete_messages"
         if bot_username else "https://t.me"
@@ -169,6 +171,17 @@ def get_group_panel_keyboard(bot_username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_format_selection_keyboard(video_id: str) -> InlineKeyboardMarkup:
+    """Keyboard to choose between MP3 (audio) and MP4 (video)."""
+    keyboard = [
+        [
+            InlineKeyboardButton("🎵 Descargar MP3 (Audio)", callback_data=f"dl:mp3:{video_id}"),
+            InlineKeyboardButton("🎬 Descargar MP4 (Video)", callback_data=f"dl:mp4:{video_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start command."""
     user = update.effective_user
@@ -180,28 +193,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         panel_url = f"https://t.me/{bot_username}?start=help" if bot_username else "https://t.me"
         keyboard = [[InlineKeyboardButton("⚙️ Ver Panel del Bot", url=panel_url)]]
         await update.message.reply_html(
-            f"👋 ¡Hola a todos! Soy el bot descargador de videos.\n\n"
+            f"👋 ¡Hola a todos! Soy el bot descargador de <b>YouTube</b> y <b>YouTube Music</b>.\n\n"
             "✨ <b>¿Cómo usarme en este grupo?</b>\n"
-            "• Compartan cualquier enlace de <b>Instagram, TikTok, Facebook o YouTube</b>.\n"
-            "• Usen el comando <code>/dl [enlace]</code> si lo prefieren.\n\n"
-            "🧹 <i>Si me dan permisos de Administrador (Eliminar mensajes), borraré automáticamente los enlaces y dejaré solo el video limpio.</i>",
+            "• Compartan cualquier enlace de <b>YouTube</b> o <b>YouTube Music</b>.\n"
+            "• Les permitiré elegir si desean descargarlo en <b>MP3</b> (Audio) o <b>MP4</b> (Video).\n"
+            "• O usen directamente <code>/mp3 [enlace]</code> o <code>/mp4 [enlace]</code>.\n\n"
+            "🧹 <i>Si me dan permisos de Administrador (Eliminar mensajes), borraré automáticamente los enlaces y dejaré solo el archivo limpio.</i>",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
     welcome_text = (
         f"👋 ¡Hola, <b>{name}</b>!\n\n"
-        "Soy tu bot para descargar videos y música a <b>máxima velocidad</b>.\n\n"
-        "✨ <b>Plataformas compatibles:</b>\n"
-        "• 🟢 <b>Spotify:</b> Canciones en MP3 con carátula oficial\n"
-        "• 📸 <b>Instagram:</b> Reels, videos y publicaciones\n"
-        "• 🎵 <b>TikTok:</b> Videos sin marca de agua\n"
-        "• 👥 <b>Facebook:</b> Reels y videos públicos\n"
-        "• ▶️ <b>YouTube:</b> Shorts y videos\n"
-        "• 🐦 <b>X (Twitter), Threads, Reddit</b> y más\n\n"
-        "👥 <b>¡Añádeme a tus grupos con un solo toque!</b>\n"
-        "Usa los botones de abajo para añadirme y activaré la descarga y auto-limpieza de links en tu grupo.\n\n"
-        "📥 <b>O pruébame aquí:</b> Envíame cualquier enlace de video o canción."
+        "Soy tu bot especialista en descargar de <b>YouTube</b> y <b>YouTube Music</b>.\n\n"
+        "✨ <b>Formatos disponibles:</b>\n"
+        "• 🎵 <b>MP3:</b> Audio en alta calidad (192 kbps) con carátula y etiquetas.\n"
+        "• 🎬 <b>MP4:</b> Video en alta resolución compatible con Telegram.\n\n"
+        "📥 <b>¿Cómo usarlo?</b>\n"
+        "Envíame cualquier enlace de YouTube o YouTube Music y elige el formato deseado.\n\n"
+        "👥 <b>¡También funciono en grupos!</b> Añádeme con los botones de abajo."
     )
 
     await update.message.reply_html(
@@ -215,13 +225,13 @@ async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = await get_bot_username(context)
     panel_text = (
         "👥 <b>PANEL DE GESTIÓN PARA GRUPOS</b>\n\n"
-        "¡Puedes añadir este bot a cualquier grupo de amigos, familia o trabajo!\n\n"
+        "Añade este bot a cualquier grupo para que todos puedan descargar música y videos de YouTube.\n\n"
         "⚡ <b>Ventajas en Grupos:</b>\n"
-        "• <b>Detección automática:</b> Descarga enlaces sin obligar a escribir comandos.\n"
-        "• <b>Limpieza de chat:</b> Elimina el mensaje del link una vez enviado el video.\n"
-        "• <b>Mención al usuario:</b> Indica quién solicitó el video para no perder el hilo.\n"
-        "• <b>Caché Compartida:</b> Si dos miembros piden el mismo video, se envía en menos de 0.5 segundos.\n"
-        "• <b>Anti-Spam:</b> No responde a mensajes comunes de charla."
+        "• <b>Selector MP3 / MP4:</b> Cada usuario elige si quiere audio o video con 1 clic.\n"
+        "• <b>Limpieza de chat:</b> Elimina el mensaje del link una vez enviado el archivo.\n"
+        "• <b>Mención al usuario:</b> Indica quién solicitó la descarga.\n"
+        "• <b>Caché Compartida:</b> Si alguien pide una canción o video ya descargado, se envía en 0.5s.\n"
+        "• <b>Anti-Spam:</b> No responde a charlas normales del grupo."
     )
 
     if update.callback_query:
@@ -241,17 +251,17 @@ async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /help command."""
     help_text = (
-        "📖 <b>Guía de Uso & Consejos:</b>\n\n"
-        "1️⃣ Ve a Instagram, TikTok, Facebook o YouTube.\n"
+        "📖 <b>Guía de Uso de YouTube & YouTube Music:</b>\n\n"
+        "1️⃣ Ve a YouTube o YouTube Music.\n"
         "2️⃣ Pulsa <i>Compartir</i> y luego <i>Copiar enlace</i>.\n"
-        "3️⃣ Envíalo al chat privado o en cualquier grupo con el bot.\n\n"
-        "💡 <b>Comandos disponibles:</b>\n"
-        "• <code>/start</code> - Menú principal y bienvenida\n"
-        "• <code>/panel</code> o <code>/grupo</code> - Panel para añadir a grupos\n"
-        "• <code>/dl [enlace]</code> - Descarga manual en grupos\n"
-        "• <code>/help</code> - Esta ayuda interactiva\n\n"
-        "⚠️ <b>Límite de tamaño:</b> Telegram permite enviar videos de hasta <b>50 MB</b>. "
-        "El bot optimiza y comprime automáticamente los videos que superen ligeramente este límite."
+        "3️⃣ Envíalo al chat privado o en cualquier grupo con el bot.\n"
+        "4️⃣ Pulsa en <b>🎵 Descargar MP3</b> para audio o <b>🎬 Descargar MP4</b> para video.\n\n"
+        "💡 <b>Comandos directos:</b>\n"
+        "• <code>/mp3 [enlace]</code> - Descarga directa en audio MP3.\n"
+        "• <code>/mp4 [enlace]</code> - Descarga directa en video MP4.\n"
+        "• <code>/start</code> - Menú principal y bienvenida.\n"
+        "• <code>/panel</code> - Panel para añadir a grupos.\n\n"
+        "⚠️ <b>Límite de tamaño:</b> Telegram permite enviar archivos de hasta <b>50 MB</b>."
     )
 
     keyboard = [
@@ -276,10 +286,10 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /about command."""
     about_text = (
         "ℹ️ <b>Acerca de este Bot:</b>\n\n"
-        "🤖 <b>Versión:</b> 2.1.0\n"
-        "⚡ <b>Motor:</b> Python + yt-dlp + FFmpeg\n"
+        "🤖 <b>Especialidad:</b> YouTube y YouTube Music (MP3 / MP4)\n"
+        "⚡ <b>Motor:</b> yt-dlp + FFmpeg\n"
         "🗄️ <b>Base de Datos:</b> SQLite Cache para envíos instantáneos\n"
-        "🧹 <b>Auto-Limpieza:</b> Borra links en grupos y elimina archivos temporales del servidor."
+        "🧹 <b>Auto-Limpieza:</b> Borra links en grupos y elimina temporales del servidor."
     )
 
     keyboard = [
@@ -300,73 +310,6 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles inline keyboard button callbacks."""
-    query = update.callback_query
-    data = query.data
-    bot_username = await get_bot_username(context)
-
-    if data == "main_menu":
-        user = update.effective_user
-        name = html.escape(user.first_name) if user and user.first_name else "amigo"
-        welcome_text = (
-            f"👋 ¡Hola, <b>{name}</b>!\n\n"
-            "Soy tu bot para descargar videos de redes sociales a <b>máxima velocidad</b>.\n\n"
-            "✨ <b>Plataformas compatibles:</b>\n"
-            "• 📸 <b>Instagram</b> • 🎵 <b>TikTok</b> • 👥 <b>Facebook</b> • ▶️ <b>YouTube</b>\n\n"
-            "📥 Envíame cualquier enlace para comenzar."
-        )
-        await query.answer()
-        await query.edit_message_text(
-            welcome_text,
-            reply_markup=get_start_keyboard(bot_username),
-            parse_mode=ParseMode.HTML
-        )
-    elif data == "group_panel":
-        await panel_command(update, context)
-    elif data == "help_menu":
-        await help_command(update, context)
-    elif data == "about_menu":
-        await about_command(update, context)
-    elif data == "group_perms":
-        perms_text = (
-            "⚙️ <b>PERMISOS RECOMENDADOS EN GRUPOS</b>\n\n"
-            "Para una experiencia óptima, asigna estos permisos al bot en el grupo:\n\n"
-            "1. 🗑️ <b>Eliminar mensajes:</b>\n"
-            "Permite al bot borrar el enlace original enviado por el usuario, dejando solo el video limpio en el chat.\n\n"
-            "2. 📤 <b>Enviar archivos multimedia (Videos):</b>\n"
-            "Necesario para poder subir los videos al grupo.\n\n"
-            "3. 👁️ <b>Leer mensajes (Modo Privacidad Desactivado):</b>\n"
-            "En @BotFather ejecuta <code>/setprivacy</code> -> <i>Disable</i>, o haz al bot Administrador para que detecte los links automáticamente."
-        )
-        keyboard = [
-            [InlineKeyboardButton("◀️ Volver al Panel", callback_data="group_panel")]
-        ]
-        await query.answer()
-        await query.edit_message_text(
-            perms_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML
-        )
-    elif data == "group_commands":
-        cmd_text = (
-            "📖 <b>COMANDOS PARA GRUPOS</b>\n\n"
-            "• <code>/dl [enlace]</code> - Descarga manual de un video.\n"
-            "• <b>Respuesta con /dl:</b> Responde a cualquier mensaje que contenga un link escribiendo <code>/dl</code>.\n"
-            "• <b>Pega directa:</b> Si el bot es Admin o tiene el modo privacidad desactivado, detecta el link automáticamente sin comandos.\n"
-            "• <code>/panel</code> - Abre el panel interactivo."
-        )
-        keyboard = [
-            [InlineKeyboardButton("◀️ Volver al Panel", callback_data="group_panel")]
-        ]
-        await query.answer()
-        await query.edit_message_text(
-            cmd_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML
-        )
-
-
 async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greets the group when added and explains features."""
     bot_id = context.bot.id
@@ -374,45 +317,48 @@ async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE
         if member.id == bot_id:
             await update.message.reply_html(
                 "🎉 <b>¡Hola! Gracias por añadirme a este grupo.</b>\n\n"
-                "📹 Descargaré videos de <b>Instagram, TikTok, Facebook y YouTube</b> automáticamente.\n\n"
+                "📹 Descargaré de <b>YouTube</b> y <b>YouTube Music</b> en formato <b>MP3</b> (Audio) o <b>MP4</b> (Video).\n\n"
                 "💡 <b>Para activar la auto-limpieza:</b>\n"
-                "Hazme administrador del grupo con permiso de <b>'Eliminar mensajes'</b> para que pueda borrar los enlaces y dejar solo los videos limpios.\n\n"
-                "¡Ya pueden empezar a compartir enlaces!"
+                "Hazme administrador con permiso de <b>'Eliminar mensajes'</b> para que pueda borrar los enlaces y dejar solo la música o videos limpios.\n\n"
+                "¡Ya pueden empezar a compartir enlaces de YouTube!"
             )
             break
 
 
-async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    """Handles the downloading, caching, sending, and auto-deletion in groups."""
-    chat = update.effective_chat
-    chat_id = chat.id
-    user_msg = update.message
-    message_id = user_msg.message_id
-    is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+async def execute_download(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: Optional[int],
+    user_mention: str,
+    video_id: str,
+    format_type: str,
+    status_message=None,
+    original_message=None,
+    is_group: bool = False
+):
+    """Core download execution for both MP3 and MP4 with caching and cleanup."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
     platform, emoji = detect_platform(url)
-
-    # Format user mention and safe URL for hyperlink
-    user = update.effective_user
-    user_mention = user.mention_html() if user else "Usuario"
+    format_type = format_type.lower().strip()
+    is_audio = (format_type == 'mp3')
     clean_url = html.escape(url)
 
-    # 1. Check Cache for Instant Delivery (< 0.5s)
-    cached_data = cache.get(url)
+    # 1. Check cache for instant delivery
+    cached_data = cache.get(video_id, format_type)
     if cached_data:
         try:
-            cached_title = cached_data.get('title', 'Video')
+            cached_title = cached_data.get('title', 'YouTube Media')
             clean_title = html.escape(cached_title[:200] + ('...' if len(cached_title) > 200 else ''))
             duration = cached_data.get('duration')
             filesize = cached_data.get('filesize', 0)
-            is_audio = bool(cached_data.get('is_audio'))
             performer = cached_data.get('performer')
-            clean_artist = html.escape(performer or '')
+            clean_performer = html.escape(performer or '')
 
             if is_audio:
                 caption = (
                     f"🎵 <b>{clean_title}</b>\n"
-                    + (f"🎤 <b>Artista:</b> {clean_artist}\n" if clean_artist else "")
-                    + f"🟢 <b>Plataforma:</b> Spotify\n"
+                    + (f"🎤 <b>Canal/Artista:</b> {clean_performer}\n" if clean_performer else "")
+                    + f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
                     f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
                     f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
                     f"👤 <b>Pedido por:</b> {user_mention}\n\n"
@@ -446,37 +392,54 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     supports_streaming=True,
                 )
 
-            # Auto-delete original message with link in groups
-            if is_group:
+            # Clean up status and original messages
+            if status_message:
                 try:
-                    await user_msg.delete()
+                    await status_message.delete()
+                except Exception:
+                    pass
+
+            if is_group and original_message:
+                try:
+                    await original_message.delete()
                 except Exception as del_err:
-                    logger.debug(f"No se pudo eliminar mensaje en grupo (requiere admin): {del_err}")
+                    logger.debug(f"No se pudo eliminar mensaje en grupo: {del_err}")
 
             return
         except Exception as e:
-            logger.info(f"Cached video failed to send, downloading fresh: {e}")
+            logger.info(f"Cached media failed, downloading fresh: {e}")
 
     # 2. Fresh download
-    item_type = "canción" if emoji == "🟢" else "video"
-    status_message = await user_msg.reply_html(
-        f"⏳ {emoji} <b>Procesando {item_type} de {platform}...</b>"
-    )
+    item_label = "audio MP3" if is_audio else "video MP4"
+    if status_message:
+        try:
+            await status_message.edit_text(
+                f"⏳ <b>Descargando {item_label} de {platform}...</b>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+    else:
+        status_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ <b>Descargando {item_label} de {platform}...</b>",
+            parse_mode=ParseMode.HTML
+        )
 
     stop_chat_action = asyncio.Event()
-    chat_action = ChatAction.UPLOAD_VOICE if emoji == "🟢" else ChatAction.UPLOAD_VIDEO
+    chat_action = ChatAction.UPLOAD_VOICE if is_audio else ChatAction.UPLOAD_VIDEO
     chat_action_task = asyncio.create_task(
-        keep_chat_action(context, chat_id, chat_action, stop_chat_action)
+        keep_chat_action(context, chat_id, chat_action, stop_event=stop_chat_action)
     )
 
     download_result = None
     try:
         async with download_semaphore:
-            download_result = await downloader.download(url)
+            download_result = await downloader.download(url, format_type=format_type)
 
         try:
             await status_message.edit_text(
-                f"⬆️ {emoji} <b>Subiendo {item_type} a Telegram...</b>",
+                f"⬆️ <b>Subiendo {item_label} a Telegram...</b>",
                 parse_mode=ParseMode.HTML
             )
         except Exception:
@@ -484,22 +447,20 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         file_path = download_result['file_path']
         thumb_path = download_result.get('thumbnail_path')
-        title = download_result.get('title', 'Audio' if emoji == "🟢" else 'Video')
+        title = download_result.get('title', 'YouTube')
         duration = download_result.get('duration')
         width = download_result.get('width')
         height = download_result.get('height')
         filesize = download_result.get('filesize', 0)
-        is_audio = bool(download_result.get('is_audio'))
         artist = download_result.get('artist')
-        clean_artist = html.escape(artist or '')
-
         clean_title = html.escape(title[:200] + ('...' if len(title) > 200 else ''))
+        clean_artist = html.escape(artist or '')
 
         if is_audio:
             caption = (
                 f"🎵 <b>{clean_title}</b>\n"
-                + (f"🎤 <b>Artista:</b> {clean_artist}\n" if clean_artist else "")
-                + f"🟢 <b>Plataforma:</b> Spotify\n"
+                + (f"🎤 <b>Canal/Artista:</b> {clean_artist}\n" if clean_artist else "")
+                + f"{emoji} <b>Plataforma:</b> {platform}\n"
                 f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
                 f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
                 f"👤 <b>Pedido por:</b> {user_mention}\n\n"
@@ -522,10 +483,11 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     )
                     if sent_msg and sent_msg.audio:
                         cache.set(
-                            url=url,
+                            video_id_or_url=video_id,
+                            format_type="mp3",
                             file_id=sent_msg.audio.file_id,
                             title=title,
-                            platform='Spotify',
+                            platform=platform,
                             duration=duration,
                             width=None,
                             height=None,
@@ -545,7 +507,6 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"👤 <b>Pedido por:</b> {user_mention}\n\n"
                 f"🔗 <a href=\"{clean_url}\">Link original</a>"
             )
-
             with open(file_path, 'rb') as video_fp:
                 thumb_fp = open(thumb_path, 'rb') if (thumb_path and os.path.exists(thumb_path)) else None
                 try:
@@ -562,11 +523,10 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         read_timeout=300,
                         write_timeout=300,
                     )
-
-                    # Save file_id to cache
                     if sent_msg and sent_msg.video:
                         cache.set(
-                            url=url,
+                            video_id_or_url=video_id,
+                            format_type="mp4",
                             file_id=sent_msg.video.file_id,
                             title=title,
                             platform=platform,
@@ -580,18 +540,18 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     if thumb_fp:
                         thumb_fp.close()
 
-        # Delete status message
+        # Delete progress message
         try:
             await status_message.delete()
         except Exception:
             pass
 
         # In groups: Delete the original message containing the link!
-        if is_group:
+        if is_group and original_message:
             try:
-                await user_msg.delete()
+                await original_message.delete()
             except Exception as del_err:
-                logger.info(f"No se pudo eliminar el link original en el grupo (¿falta permiso de Eliminar mensajes?): {del_err}")
+                logger.info(f"No se pudo eliminar el link original en el grupo: {del_err}")
 
     except ValueError as val_err:
         logger.warning(f"Validation error for {url}: {val_err}")
@@ -607,7 +567,7 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
         logger.error(f"Unexpected error downloading {url}: {e}", exc_info=True)
         err_msg = (
             "❌ <b>Ocurrió un error al procesar el enlace.</b>\n"
-            "Verifica que el enlace sea válido y el video sea público."
+            "Verifica que el video sea público y esté disponible."
         )
         try:
             await status_message.edit_text(err_msg, parse_mode=ParseMode.HTML)
@@ -621,29 +581,181 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
             downloader.cleanup(download_result)
 
 
-async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /dl or /descargar command."""
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles inline keyboard button callbacks."""
+    query = update.callback_query
+    data = query.data
+    bot_username = await get_bot_username(context)
+
+    # 1. Download format selection: dl:mp3:<id> or dl:mp4:<id>
+    if data.startswith("dl:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, format_type, video_id = parts
+            await query.answer()
+
+            user = update.effective_user
+            user_mention = user.mention_html() if user else "Usuario"
+            chat = update.effective_chat
+            is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+
+            await execute_download(
+                context=context,
+                chat_id=chat.id,
+                user_id=user.id if user else None,
+                user_mention=user_mention,
+                video_id=video_id,
+                format_type=format_type,
+                status_message=query.message,
+                original_message=None,
+                is_group=is_group,
+            )
+            return
+
+    # 2. Menu navigation
+    if data == "main_menu":
+        user = update.effective_user
+        name = html.escape(user.first_name) if user and user.first_name else "amigo"
+        welcome_text = (
+            f"👋 ¡Hola, <b>{name}</b>!\n\n"
+            "Soy tu bot para descargar de <b>YouTube</b> y <b>YouTube Music</b>.\n\n"
+            "✨ <b>Formatos disponibles:</b>\n"
+            "• 🎵 <b>MP3:</b> Audio en alta calidad con etiquetas y portada.\n"
+            "• 🎬 <b>MP4:</b> Video optimizado para Telegram.\n\n"
+            "📥 Envíame cualquier enlace de YouTube o YouTube Music para comenzar."
+        )
+        await query.answer()
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=get_start_keyboard(bot_username),
+            parse_mode=ParseMode.HTML
+        )
+    elif data == "group_panel":
+        await panel_command(update, context)
+    elif data == "help_menu":
+        await help_command(update, context)
+    elif data == "about_menu":
+        await about_command(update, context)
+    elif data == "group_perms":
+        perms_text = (
+            "⚙️ <b>PERMISOS RECOMENDADOS EN GRUPOS</b>\n\n"
+            "Para una experiencia óptima, asigna estos permisos al bot en el grupo:\n\n"
+            "1. 🗑️ <b>Eliminar mensajes:</b>\n"
+            "Permite al bot borrar el enlace original enviado por el usuario, dejando solo la música o video limpios en el chat.\n\n"
+            "2. 📤 <b>Enviar archivos multimedia (Audio y Video):</b>\n"
+            "Necesario para subir archivos MP3 y MP4 al grupo.\n\n"
+            "3. 👁️ <b>Leer mensajes (Modo Privacidad Desactivado):</b>\n"
+            "En @BotFather ejecuta <code>/setprivacy</code> -> <i>Disable</i>, o haz al bot Administrador para que detecte los links automáticamente."
+        )
+        keyboard = [
+            [InlineKeyboardButton("◀️ Volver al Panel", callback_data="group_panel")]
+        ]
+        await query.answer()
+        await query.edit_message_text(
+            perms_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
+    elif data == "group_commands":
+        cmd_text = (
+            "📖 <b>COMANDOS PARA GRUPOS</b>\n\n"
+            "• <code>/mp3 [enlace]</code> - Descarga directa en audio MP3.\n"
+            "• <code>/mp4 [enlace]</code> - Descarga directa en video MP4.\n"
+            "• <code>/dl [enlace]</code> - Abre el selector interactivo MP3/MP4.\n"
+            "• <b>Pega directa:</b> Si el bot es Admin o tiene privacidad desactivada, muestra el selector al pegar un link.\n"
+            "• <code>/panel</code> - Abre el panel interactivo."
+        )
+        keyboard = [
+            [InlineKeyboardButton("◀️ Volver al Panel", callback_data="group_panel")]
+        ]
+        await query.answer()
+        await query.edit_message_text(
+            cmd_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def direct_format_command(update: Update, context: ContextTypes.DEFAULT_TYPE, forced_format: str):
+    """Handler for direct /mp3 or /mp4 commands."""
     text = " ".join(context.args) if context.args else ""
     urls = URL_REGEX.findall(text)
 
-    # Check if replying to another message with link
     if not urls and update.message.reply_to_message:
         reply_text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
         urls = URL_REGEX.findall(reply_text)
 
     if not urls:
         await update.message.reply_html(
-            "ℹ️ <b>Uso del comando:</b>\n<code>/dl [enlace del video]</code>\n"
-            "O responde a un mensaje con link escribiendo <code>/dl</code>."
+            f"ℹ️ <b>Uso del comando:</b>\n<code>/{forced_format} [enlace de YouTube]</code>\n"
+            f"O responde a un mensaje que contenga un enlace de YouTube usando <code>/{forced_format}</code>."
         )
         return
 
     url = urls[0].strip()
-    await process_video_link(update, context, url)
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        await update.message.reply_html("❌ No se reconoció un ID válido de YouTube.")
+        return
+
+    user = update.effective_user
+    user_mention = user.mention_html() if user else "Usuario"
+    chat = update.effective_chat
+    is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+
+    await execute_download(
+        context=context,
+        chat_id=chat.id,
+        user_id=user.id if user else None,
+        user_mention=user_mention,
+        video_id=video_id,
+        format_type=forced_format,
+        status_message=None,
+        original_message=update.message,
+        is_group=is_group,
+    )
+
+
+async def mp3_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await direct_format_command(update, context, "mp3")
+
+
+async def mp4_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await direct_format_command(update, context, "mp4")
+
+
+async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for /dl command."""
+    text = " ".join(context.args) if context.args else ""
+    urls = URL_REGEX.findall(text)
+
+    if not urls and update.message.reply_to_message:
+        reply_text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
+        urls = URL_REGEX.findall(reply_text)
+
+    if not urls:
+        await update.message.reply_html(
+            "ℹ️ <b>Uso del comando:</b>\n<code>/dl [enlace de YouTube]</code>"
+        )
+        return
+
+    url = urls[0].strip()
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        await update.message.reply_html("❌ Por favor envía un enlace válido de YouTube o YouTube Music.")
+        return
+
+    platform, emoji = detect_platform(url)
+    reply_markup = get_format_selection_keyboard(video_id)
+    await update.message.reply_html(
+        f"{emoji} <b>{platform} detectado</b>\n\n"
+        "¿En qué formato deseas descargarlo?",
+        reply_markup=reply_markup
+    )
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming messages."""
+    """Processes incoming messages from users and groups."""
     if not update.message:
         return
 
@@ -652,17 +764,37 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_group = update.effective_chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
 
     if not urls:
+        # In groups, stay silent on normal chatter to avoid spamming members
         if not is_group:
             bot_username = await get_bot_username(context)
             await update.message.reply_html(
                 "ℹ️ <b>Enlace no detectado.</b>\n\n"
-                "Por favor, envíame un enlace de video de <b>Instagram, TikTok, Facebook o YouTube</b>.",
+                "Por favor, envíame un enlace de <b>YouTube</b> o <b>YouTube Music</b> "
+                "para descargarlo en formato <b>MP3</b> o <b>MP4</b>.",
                 reply_markup=get_start_keyboard(bot_username)
             )
         return
 
     url = urls[0].strip()
-    await process_video_link(update, context, url)
+    video_id = extract_youtube_id(url)
+
+    if not video_id:
+        if not is_group:
+            await update.message.reply_html(
+                "❌ <b>Enlace no compatible:</b>\n"
+                "Este bot está configurado para descargar de <b>YouTube</b> y <b>YouTube Music</b>.\n\n"
+                "Formatos admitidos: <code>youtube.com</code>, <code>youtu.be</code>, <code>music.youtube.com</code>."
+            )
+        return
+
+    platform, emoji = detect_platform(url)
+    reply_markup = get_format_selection_keyboard(video_id)
+
+    await update.message.reply_html(
+        f"{emoji} <b>{platform} detectado:</b>\n\n"
+        "¿En qué formato deseas descargarlo?",
+        reply_markup=reply_markup
+    )
 
 
 def main():
@@ -676,7 +808,7 @@ def main():
         print("=" * 60 + "\n")
         return
 
-    print("🚀 Iniciando Bot de Descarga de Videos (Auto-Delete & Panel de Grupos)...")
+    print("🚀 Iniciando Bot de YouTube y YouTube Music (MP3 / MP4)...")
     start_health_server()
 
     request = HTTPXRequest(
@@ -693,6 +825,8 @@ def main():
     app.add_handler(CommandHandler(["panel", "grupo", "grupos", "anadir", "agregar", "addgroup"], panel_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler(["mp3", "audio", "musica"], mp3_command))
+    app.add_handler(CommandHandler(["mp4", "video"], mp4_command))
     app.add_handler(CommandHandler(["dl", "descargar", "bajar"], dl_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))

@@ -10,10 +10,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "cache.db")
 
 
 def normalize_url(url: str) -> str:
-    """
-    Strips tracking queries (igsh, si, utm_*, fbclid, etc.)
-    to ensure matching cached videos even if shared with different tracking tags.
-    """
+    """Strips tracking queries to ensure clean URL keys."""
     try:
         parsed = urlparse(url.strip())
         clean_netloc = parsed.netloc.lower()
@@ -59,7 +56,6 @@ class VideoCache:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Safe migration for existing DB
             try:
                 conn.execute("ALTER TABLE video_cache ADD COLUMN is_audio INTEGER DEFAULT 0")
             except Exception:
@@ -70,11 +66,17 @@ class VideoCache:
                 pass
             conn.commit()
 
-    def get(self, url: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieves cached video/audio metadata and Telegram file_id by URL.
-        """
-        key = normalize_url(url)
+    def _make_key(self, video_id_or_url: str, format_type: str = "mp4") -> str:
+        fmt = format_type.lower().strip()
+        # If it's already an 11-char ID
+        if len(video_id_or_url) == 11 and not ('/' in video_id_or_url or '.' in video_id_or_url):
+            return f"{video_id_or_url}:{fmt}"
+        clean = normalize_url(video_id_or_url)
+        return f"{clean}:{fmt}"
+
+    def get(self, video_id_or_url: str, format_type: str = "mp4") -> Optional[Dict[str, Any]]:
+        """Retrieves cached metadata and Telegram file_id."""
+        key = self._make_key(video_id_or_url, format_type)
         try:
             with self._get_connection() as conn:
                 cur = conn.cursor()
@@ -86,14 +88,12 @@ class VideoCache:
                 if row:
                     return dict(row)
         except Exception as e:
-            logger.warning(f"Error reading cache for {url}: {e}")
+            logger.warning(f"Error reading cache for {video_id_or_url}: {e}")
         return None
 
-    def set(self, url: str, file_id: str, title: str, platform: str, duration: Optional[int], width: Optional[int], height: Optional[int], filesize: int, is_audio: bool = False, performer: Optional[str] = None):
-        """
-        Saves Telegram file_id and metadata for a video/audio URL.
-        """
-        key = normalize_url(url)
+    def set(self, video_id_or_url: str, format_type: str, file_id: str, title: str, platform: str, duration: Optional[int], width: Optional[int], height: Optional[int], filesize: int, is_audio: bool = False, performer: Optional[str] = None):
+        """Saves Telegram file_id and metadata for a video/audio in specific format."""
+        key = self._make_key(video_id_or_url, format_type)
         try:
             with self._get_connection() as conn:
                 conn.execute("""
@@ -102,4 +102,4 @@ class VideoCache:
                 """, (key, file_id, title, platform, duration, width, height, filesize, 1 if is_audio else 0, performer))
                 conn.commit()
         except Exception as e:
-            logger.warning(f"Error saving to cache for {url}: {e}")
+            logger.warning(f"Error saving to cache for {video_id_or_url}: {e}")
