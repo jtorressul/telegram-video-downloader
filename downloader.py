@@ -7,6 +7,7 @@ import tempfile
 import asyncio
 import subprocess
 import urllib.request
+from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any, Optional, Tuple
 import yt_dlp
 
@@ -14,15 +15,35 @@ import yt_dlp
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 TARGET_COMPRESSION_BYTES = 45 * 1024 * 1024  # 45 MB
 
-YT_REGEX = re.compile(
-    r'(?:https?://)?(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?v=|embed/|shorts/|v/|e/)|youtu\.be/)([a-zA-Z0-9_-]{11})'
-)
-
 
 def extract_youtube_id(url: str) -> Optional[str]:
-    """Extracts 11-character YouTube video ID."""
-    match = YT_REGEX.search(url)
-    return match.group(1) if match else None
+    """Extracts 11-character YouTube video ID supporting all formats and arbitrary query parameters."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc.lower()
+        path = parsed.path
+        if any(d in netloc for d in ['youtube.com', 'youtu.be']):
+            if path in ['/watch', '/watch_popup']:
+                qs = parse_qs(parsed.query)
+                v = qs.get('v')
+                if v and len(v[0]) == 11:
+                    return v[0]
+            elif path.startswith(('/embed/', '/v/', '/shorts/', '/e/')):
+                parts = path.strip('/').split('/')
+                if len(parts) >= 2 and len(parts[1]) == 11:
+                    return parts[1]
+            elif 'youtu.be' in netloc:
+                parts = path.strip('/').split('/')
+                if parts and len(parts[0]) == 11:
+                    return parts[0]
+    except Exception:
+        pass
+
+    # Regex fallback
+    m = re.search(r'(?:[?&]v=|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})', url)
+    return m.group(1) if m else None
 
 
 def is_youtube_url(url: str) -> bool:

@@ -476,6 +476,10 @@ async def execute_download(
         format_type = "mp3"
     format_type = format_type.lower().strip()
     is_audio = (format_type == 'mp3')
+    if is_yt:
+        yt_id = extract_youtube_id(url)
+        if yt_id:
+            url = f"https://www.youtube.com/watch?v={yt_id}"
     clean_url = html.escape(url)
 
     # 1. Quota & Permission Verification (Only enforced in groups!)
