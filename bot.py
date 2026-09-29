@@ -277,10 +277,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 ¡Hola, <b>{name}</b>!\n\n"
-        "Soy tu bot para descargar videos y música de <b>YouTube, Spotify, Instagram, TikTok, X y Facebook</b>.\n\n"
-        "⚡ <b>Chat Privado:</b> Descargas libres e ilimitadas para todas las plataformas soportadas.\n"
-        f"👥 <b>En Grupos:</b> Aplica sistema de membresías ({NO_VIP_DAILY_LIMIT} para NO VIP, {VIP_DAILY_LIMIT} para VIP).\n\n"
-        "📊 Usa <code>/stats</code> para ver tus estadísticas de descarga.\n\n"
+        "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b>.\n\n"
+        "✨ <b>Niveles de Membresía:</b>\n"
+        f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas al día (Instagram, TikTok, X).\n"
+        f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas al día (Todas las plataformas: YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
+        "📊 Usa <code>/stats</code> para ver tu consumo diario y estado.\n\n"
         "📥 <b>¿Cómo usarlo?</b> Envíame cualquier enlace para comenzar."
     )
 
@@ -337,11 +338,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 <b>Guía de Uso & Límites del Bot:</b>\n\n"
         "1️⃣ Copia el enlace del video o audio que deseas.\n"
         "2️⃣ Envíalo al chat privado o en el grupo.\n\n"
-        "⚡ <b>En Chat Privado:</b>\n"
-        "• Descargas <b>libres e ilimitadas</b> para todas las plataformas (YouTube, Spotify, Instagram, etc.).\n\n"
-        "👥 <b>En Grupos (Sistema VIP):</b>\n"
+        "📋 <b>Reglas de Acceso (Privado y Grupos):</b>\n"
         f"• <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día en <b>X, Instagram y TikTok</b>.\n"
-        f"• <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día en <b>todas las plataformas</b> (YouTube MP3/MP4, Facebook, etc.).\n\n"
+        f"• <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día en <b>todas las plataformas</b> (YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
         "💡 <b>Comandos disponibles:</b>\n"
         "• <code>/stats</code> - Muestra tus estadísticas y cuota diaria.\n"
         "• <code>/mp3 [enlace]</code> - Descarga directa en audio MP3.\n"
@@ -482,38 +481,37 @@ async def execute_download(
             url = f"https://www.youtube.com/watch?v={yt_id}"
     clean_url = html.escape(url)
 
-    # 1. Quota & Permission Verification (Only enforced in groups!)
-    if is_group:
-        allowed, reason, user_data = user_db.check_download_permission(user_id, platform)
-        if not allowed:
-            if status_message:
-                try:
-                    await status_message.delete()
-                except Exception:
-                    pass
+    # 1. Quota & Permission Verification (Enforced both in private and groups)
+    allowed, reason, user_data = user_db.check_download_permission(user_id, platform)
+    if not allowed:
+        if status_message:
+            try:
+                await status_message.delete()
+            except Exception:
+                pass
 
-            if reason == "platform_restricted":
-                deny_text = (
-                    "🔒 <b>Función Exclusiva VIP</b>\n\n"
-                    "Tu estado actual en este grupo es <b>NO VIP PASS</b>.\n"
-                    "Plataformas permitidas para tu rango en el grupo:\n"
-                    "• 🐦 <b>X (Twitter)</b>\n"
-                    "• 📸 <b>Instagram</b>\n"
-                    "• 🎵 <b>TikTok</b>\n\n"
-                    f"Para descargar de <b>{platform}</b> en el grupo, solicita tu rango VIP a un administrador."
-                )
-                await context.bot.send_message(chat_id=chat_id, text=deny_text, parse_mode=ParseMode.HTML)
-                return
+        if reason == "platform_restricted":
+            deny_text = (
+                "🔒 <b>Función Exclusiva VIP</b>\n\n"
+                "Tu estado actual es <b>NO VIP PASS</b>.\n"
+                "Plataformas permitidas para tu rango:\n"
+                "• 🐦 <b>X (Twitter)</b>\n"
+                "• 📸 <b>Instagram</b>\n"
+                "• 🎵 <b>TikTok</b>\n\n"
+                f"Para descargar de <b>{platform}</b>, solicita tu rango VIP a un administrador del grupo."
+            )
+            await context.bot.send_message(chat_id=chat_id, text=deny_text, parse_mode=ParseMode.HTML)
+            return
 
-            elif reason == "daily_limit_reached":
-                max_daily = VIP_DAILY_LIMIT if user_data.get('is_vip') else NO_VIP_DAILY_LIMIT
-                limit_text = (
-                    f"📉 <b>Límite diario alcanzado en el grupo ({max_daily}/{max_daily})</b>\n\n"
-                    f"Has utilizado tus <b>{max_daily} descargas diarias</b> de hoy en este grupo.\n"
-                    "Tu cuota se reiniciará automáticamente a la medianoche (00:00)."
-                )
-                await context.bot.send_message(chat_id=chat_id, text=limit_text, parse_mode=ParseMode.HTML)
-                return
+        elif reason == "daily_limit_reached":
+            max_daily = VIP_DAILY_LIMIT if user_data.get('is_vip') else NO_VIP_DAILY_LIMIT
+            limit_text = (
+                f"📉 <b>Límite diario alcanzado ({max_daily}/{max_daily})</b>\n\n"
+                f"Has utilizado tus <b>{max_daily} descargas diarias</b> de hoy.\n"
+                "Tu cuota se reiniciará automáticamente a la medianoche (00:00)."
+            )
+            await context.bot.send_message(chat_id=chat_id, text=limit_text, parse_mode=ParseMode.HTML)
+            return
 
     # 2. Check cache for instant delivery
     cache_key = extract_youtube_id(url) if is_yt else url
@@ -566,7 +564,7 @@ async def execute_download(
                 )
 
             # Record stats
-            user_db.record_download_success(user_id, platform, is_group=is_group)
+            user_db.record_download_success(user_id, platform)
 
             if status_message:
                 try:
@@ -716,7 +714,7 @@ async def execute_download(
                         thumb_fp.close()
 
         # Successfully downloaded & sent -> record stats
-        user_db.record_download_success(user_id, platform, is_group=is_group)
+        user_db.record_download_success(user_id, platform)
 
         # Delete progress message
         try:
@@ -809,9 +807,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = html.escape(user.first_name) if user and user.first_name else "amigo"
         welcome_text = (
             f"👋 ¡Hola, <b>{name}</b>!\n\n"
-            "Soy tu bot para descargar videos y música de <b>YouTube, Spotify, Instagram, TikTok, X y Facebook</b>.\n\n"
-            "⚡ <b>Chat Privado:</b> Descargas libres e ilimitadas para todas las plataformas soportadas.\n"
-            f"👥 <b>En Grupos:</b> Aplica sistema VIP ({NO_VIP_DAILY_LIMIT} para NO VIP, {VIP_DAILY_LIMIT} para VIP).\n\n"
+            "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b>.\n\n"
+            "✨ <b>Niveles de Membresía:</b>\n"
+            f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día (Instagram, TikTok, X).\n"
+            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día (YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
             "📥 Envíame cualquier enlace para comenzar."
         )
         await query.answer()

@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_users.db")
 
 NO_VIP_DAILY_LIMIT = 10
-VIP_DAILY_LIMIT = 20
+VIP_DAILY_LIMIT = 15
 
 SOCIAL_PLATFORMS = {"Instagram", "TikTok", "X (Twitter)"}
 
@@ -138,8 +138,8 @@ class UserDatabase:
 
         return True, "ok", user
 
-    def record_download_success(self, user_id: int, platform: str, is_group: bool = False):
-        """Increments download stats and daily quota (quota only incremented for group downloads)."""
+    def record_download_success(self, user_id: int, platform: str):
+        """Increments download stats and daily quota."""
         today_str = date.today().isoformat()
         is_social = 1 if platform in SOCIAL_PLATFORMS else 0
 
@@ -148,8 +148,6 @@ class UserDatabase:
             daily_used = user.get('daily_downloads', 0)
             if user.get('last_download_date') != today_str:
                 daily_used = 0
-
-            new_daily = (daily_used + 1) if is_group else daily_used
 
             conn.execute("""
                 UPDATE users SET
@@ -162,7 +160,7 @@ class UserDatabase:
             """, (
                 1 if is_social else 0,
                 0 if is_social else 1,
-                new_daily,
+                daily_used + 1,
                 today_str,
                 user_id
             ))
@@ -188,6 +186,5 @@ class UserDatabase:
             f"💎 <b>Estado:</b> {status_text}\n"
             f"📥 <b>Descargas totales:</b> {total}\n"
             f"📱 <b>Social:</b> {social} | 🌐 <b>Otras:</b> {other}\n"
-            f"🗓 <b>Cuota diaria (grupo):</b> {daily}/{max_daily}\n\n"
-            "⚡ <i>Las descargas por chat privado son libres e ilimitadas.</i>"
+            f"🗓 <b>Cuota diaria:</b> {daily}/{max_daily}"
         )
