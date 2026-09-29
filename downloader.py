@@ -5,11 +5,14 @@ import glob
 import shutil
 import tempfile
 import asyncio
+import logging
 import subprocess
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any, Optional, Tuple
 import yt_dlp
+
+logger = logging.getLogger(__name__)
 
 # Telegram Bot API limits standard bots to 50MB for upload
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -401,7 +404,7 @@ class VideoDownloader:
             ydl_opts['cookiefile'] = self.cookies_file
 
         # Execution with sequential client fallbacks for YouTube
-        clients_to_try = [None, ['android'], ['web_safari'], ['mweb']] if is_yt else [None]
+        clients_to_try = [['android'], None, ['web_safari'], ['mweb']] if is_yt else [None]
         info = None
         active_ydl = None
         last_error = None
