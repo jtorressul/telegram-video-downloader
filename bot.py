@@ -390,9 +390,10 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
     is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
     platform, emoji = detect_platform(url)
 
-    # Format user mention
+    # Format user mention and safe URL for hyperlink
     user = update.effective_user
     user_mention = user.mention_html() if user else "Usuario"
+    clean_url = html.escape(url)
 
     # 1. Check Cache for Instant Delivery (< 0.5s)
     cached_data = cache.get(url)
@@ -408,7 +409,8 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
                 f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
                 f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
-                f"👤 <b>Pedido por:</b> {user_mention}\n"
+                f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
                 f"⚡ <i>Descarga instantánea</i>"
             )
 
@@ -468,7 +470,8 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"{emoji} <b>Plataforma:</b> {platform}\n"
             f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
             f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
-            f"👤 <b>Pedido por:</b> {user_mention}"
+            f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+            f"🔗 <a href=\"{clean_url}\">Link original</a>"
         )
 
         with open(file_path, 'rb') as video_fp:
