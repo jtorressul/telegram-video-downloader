@@ -185,10 +185,37 @@ def compress_video_ffmpeg(input_file: str, output_file: str, duration: float) ->
     return False
 
 
+def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
+    """Sets up cookies from environment variable if present, or checks existing file."""
+    cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("COOKIES_CONTENT")
+    if cookies_env and cookies_env.strip():
+        try:
+            with open(cookies_path, "w", encoding="utf-8") as f:
+                f.write(cookies_env.strip() + "\n")
+            return cookies_path
+        except Exception:
+            pass
+
+    if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+        return cookies_path
+    return None
+
+
+def get_js_runtimes_config() -> Optional[Dict[str, Any]]:
+    """Detects available JS runtime (node/deno) for yt-dlp challenge solving."""
+    node_path = shutil.which("node") or shutil.which("nodejs")
+    if node_path:
+        return {'node': {'path': node_path}}
+    deno_path = shutil.which("deno")
+    if deno_path:
+        return {'deno': {'path': deno_path}}
+    return None
+
+
 class VideoDownloader:
     def __init__(self, temp_dir: Optional[str] = None, cookies_file: Optional[str] = None):
         self.temp_dir = temp_dir or tempfile.gettempdir()
-        self.cookies_file = cookies_file if (cookies_file and os.path.exists(cookies_file)) else None
+        self.cookies_file = setup_cookies_file(cookies_file or "cookies.txt")
 
     def _sync_download_spotify(self, url: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
         """Downloads high quality audio matching a Spotify track using YouTube backend with mobile player client."""
@@ -207,7 +234,7 @@ class VideoDownloader:
             }],
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios'],
+                    'player_client': ['default', 'web_safari', 'web_embedded', 'ios', 'android'],
                 }
             },
             'quiet': True,
@@ -215,6 +242,13 @@ class VideoDownloader:
             'noplaylist': True,
             'max_filesize': MAX_TELEGRAM_SIZE_BYTES,
         }
+
+        js_cfg = get_js_runtimes_config()
+        if js_cfg:
+            ydl_opts['js_runtimes'] = js_cfg
+
+        if self.cookies_file:
+            ydl_opts['cookiefile'] = self.cookies_file
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -302,11 +336,16 @@ class VideoDownloader:
             },
         }
 
-        # Mobile client impersonation for YouTube to avoid bot checks
+        # JS runtime configuration for n-challenge solving
+        js_cfg = get_js_runtimes_config()
+        if js_cfg:
+            ydl_opts['js_runtimes'] = js_cfg
+
+        # Resilient client configuration for YouTube to avoid bot verification
         if is_yt:
             ydl_opts['extractor_args'] = {
                 'youtube': {
-                    'player_client': ['android', 'ios'],
+                    'player_client': ['default', 'web_safari', 'web_embedded', 'ios', 'android'],
                 }
             }
 
@@ -329,105 +368,128 @@ class VideoDownloader:
         if self.cookies_file:
             ydl_opts['cookiefile'] = self.cookies_file
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=True)
-            except Exception as e:
-                err_msg = str(e)
+        active_ydl = yt_dlp.YoutubeDL(ydl_opts)
+        try:
+            info = active_ydl.extract_info(url, download=True)
+        except Exception as e:
+            err_msg = str(e)
+            if is_yt and ('Sign in to confirm you’re not a bot' in err_msg or 'bot' in err_msg.lower()):
+                # Automatic fallback: retry with mobile/web clients
+                retry_opts = dict(ydl_opts)
+                retry_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': ['ios', 'android', 'mweb', 'web_safari'],
+                    }
+                }
+                active_ydl = yt_dlp.YoutubeDL(retry_opts)
+                try:
+                    info = active_ydl.extract_info(url, download=True)
+                except Exception as e2:
+                    err_msg2 = str(e2)
+                    if 'Sign in to confirm you’re not a bot' in err_msg2:
+                        raise ValueError(
+                            "YouTube solicitó verificación de bot para la IP del servidor. "
+                            "Para solucionarlo de forma permanente, añade tus cookies en la variable de entorno YOUTUBE_COOKIES."
+                        )
+                    raise ValueError(f"Error al descargar: {err_msg2}")
+            else:
                 if 'Private video' in err_msg or 'This video is private' in err_msg:
                     raise ValueError("El video es privado o no está disponible.")
                 elif 'Sign in to confirm you’re not a bot' in err_msg:
-                    raise ValueError("La plataforma solicitó verificación de bot. Reintenta en unos instantes.")
+                    raise ValueError(
+                        "YouTube solicitó verificación de bot para la IP del servidor. "
+                        "Para solucionarlo de forma permanente, añade tus cookies en la variable de entorno YOUTUBE_COOKIES."
+                    )
                 elif 'Video unavailable' in err_msg:
                     raise ValueError("El video no está disponible o fue eliminado.")
                 raise ValueError(f"Error al descargar: {err_msg}")
 
-            if not info:
-                raise ValueError("No se pudo obtener información del enlace proporcionado.")
+        if not info:
+            raise ValueError("No se pudo obtener información del enlace proporcionado.")
 
-            if 'entries' in info and info['entries']:
-                info = info['entries'][0]
+        if 'entries' in info and info['entries']:
+            info = info['entries'][0]
 
-            title = info.get('title', 'Video')
-            uploader = info.get('uploader') or info.get('channel') or platform_name
-            duration = info.get('duration', 0) or 0
-            width = info.get('width')
-            height = info.get('height')
+        title = info.get('title', 'Video')
+        uploader = info.get('uploader') or info.get('channel') or platform_name
+        duration = info.get('duration', 0) or 0
+        width = info.get('width')
+        height = info.get('height')
 
-            base_filename = ydl.prepare_filename(info)
-            result_file = None
+        base_filename = active_ydl.prepare_filename(info)
+        result_file = None
 
-            if format_type == 'mp3':
-                target_mp3 = os.path.splitext(base_filename)[0] + '.mp3'
-                if os.path.exists(target_mp3):
-                    result_file = target_mp3
-                else:
-                    for f in os.listdir(temp_subfolder):
-                        if f.lower().endswith('.mp3'):
-                            result_file = os.path.join(temp_subfolder, f)
-                            break
+        if format_type == 'mp3':
+            target_mp3 = os.path.splitext(base_filename)[0] + '.mp3'
+            if os.path.exists(target_mp3):
+                result_file = target_mp3
             else:
-                candidates = [
-                    os.path.splitext(base_filename)[0] + '.mp4',
-                    base_filename,
-                ]
-                for c in candidates:
-                    if os.path.exists(c) and os.path.getsize(c) > 0:
-                        result_file = c
+                for f in os.listdir(temp_subfolder):
+                    if f.lower().endswith('.mp3'):
+                        result_file = os.path.join(temp_subfolder, f)
                         break
-
-                if not result_file:
-                    prefix = os.path.splitext(base_filename)[0]
-                    matches = glob.glob(f"{glob.escape(prefix)}*")
-                    for m in matches:
-                        if m.lower().endswith(('.mp4', '.mkv', '.webm', '.mov')) and os.path.getsize(m) > 0:
-                            result_file = m
-                            break
-
-            if not result_file or not os.path.exists(result_file):
-                raise FileNotFoundError(f"No se encontró el archivo descargado.")
-
-            file_size = os.path.getsize(result_file)
-
-            # Compress video if slightly over 50MB
-            if format_type == 'mp4' and file_size > MAX_TELEGRAM_SIZE_BYTES:
-                if duration and 0 < duration < 900:
-                    compressed_path = os.path.join(temp_subfolder, 'compressed_video.mp4')
-                    if compress_video_ffmpeg(result_file, compressed_path, float(duration)):
-                        result_file = compressed_path
-                        file_size = os.path.getsize(result_file)
-
-            if file_size > MAX_TELEGRAM_SIZE_BYTES:
-                raise ValueError(
-                    f"El archivo pesa {file_size / (1024 * 1024):.1f} MB, "
-                    f"superando el límite de 50 MB de Telegram."
-                )
-
-            # Look for thumbnail
-            raw_thumb = None
-            thumb_prefix = os.path.splitext(base_filename)[0]
-            for ext in ['.jpg', '.jpeg', '.webp', '.png']:
-                t_cand = thumb_prefix + ext
-                if os.path.exists(t_cand):
-                    raw_thumb = t_cand
+        else:
+            candidates = [
+                os.path.splitext(base_filename)[0] + '.mp4',
+                base_filename,
+            ]
+            for c in candidates:
+                if os.path.exists(c) and os.path.getsize(c) > 0:
+                    result_file = c
                     break
 
-            final_thumb = convert_thumbnail_to_jpg(raw_thumb, result_file, temp_subfolder)
+            if not result_file:
+                prefix = os.path.splitext(base_filename)[0]
+                matches = glob.glob(f"{glob.escape(prefix)}*")
+                for m in matches:
+                    if m.lower().endswith(('.mp4', '.mkv', '.webm', '.mov')) and os.path.getsize(m) > 0:
+                        result_file = m
+                        break
 
-            return {
-                'file_path': result_file,
-                'thumbnail_path': final_thumb,
-                'title': title,
-                'artist': uploader,
-                'duration': int(duration) if duration else None,
-                'width': width,
-                'height': height,
-                'filesize': file_size,
-                'platform': platform_name,
-                'platform_emoji': platform_emoji,
-                'is_audio': (format_type == 'mp3'),
-                'format': format_type,
-            }
+        if not result_file or not os.path.exists(result_file):
+            raise FileNotFoundError(f"No se encontró el archivo descargado.")
+
+        file_size = os.path.getsize(result_file)
+
+        # Compress video if slightly over 50MB
+        if format_type == 'mp4' and file_size > MAX_TELEGRAM_SIZE_BYTES:
+            if duration and 0 < duration < 900:
+                compressed_path = os.path.join(temp_subfolder, 'compressed_video.mp4')
+                if compress_video_ffmpeg(result_file, compressed_path, float(duration)):
+                    result_file = compressed_path
+                    file_size = os.path.getsize(result_file)
+
+        if file_size > MAX_TELEGRAM_SIZE_BYTES:
+            raise ValueError(
+                f"El archivo pesa {file_size / (1024 * 1024):.1f} MB, "
+                f"superando el límite de 50 MB de Telegram."
+            )
+
+        # Look for thumbnail
+        raw_thumb = None
+        thumb_prefix = os.path.splitext(base_filename)[0]
+        for ext in ['.jpg', '.jpeg', '.webp', '.png']:
+            t_cand = thumb_prefix + ext
+            if os.path.exists(t_cand):
+                raw_thumb = t_cand
+                break
+
+        final_thumb = convert_thumbnail_to_jpg(raw_thumb, result_file, temp_subfolder)
+
+        return {
+            'file_path': result_file,
+            'thumbnail_path': final_thumb,
+            'title': title,
+            'artist': uploader,
+            'duration': int(duration) if duration else None,
+            'width': width,
+            'height': height,
+            'filesize': file_size,
+            'platform': platform_name,
+            'platform_emoji': platform_emoji,
+            'is_audio': (format_type == 'mp3'),
+            'format': format_type,
+        }
 
     async def download(self, url: str, format_type: str = "mp4") -> Dict[str, Any]:
         """Asynchronously downloads media."""

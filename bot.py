@@ -48,7 +48,7 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip()
 ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip().isdigit()]
 
 # Initialize services
-downloader = VideoDownloader(cookies_file=COOKIES_FILE if os.path.exists(COOKIES_FILE) else None)
+downloader = VideoDownloader(cookies_file=COOKIES_FILE)
 cache = VideoCache()
 user_db = UserDatabase()
 

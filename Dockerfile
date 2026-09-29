@@ -1,10 +1,11 @@
 FROM python:3.11-slim
 
-# Install ffmpeg and ca-certificates
+# Install ffmpeg, ca-certificates, curl, and nodejs (for yt-dlp JS challenges)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
     curl \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
