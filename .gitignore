@@ -1,0 +1,33 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# Cookies (sensitive data)
+cookies.txt
+*.cookies
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary downloads
+downloads/
+tmp/
+temp/
+*.mp4
+*.webm
+*.mkv
+*.jpg
+*.jpeg
+*.webp
+*.png
+
+# SQLite Cache
+cache.db
+cache.db-journal
+

@@ -1,0 +1,9 @@
+services:
+  telegram-downloader-bot:
+    build: .
+    container_name: tg_video_downloader
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./cache.db:/app/cache.db
