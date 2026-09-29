@@ -239,86 +239,101 @@ class VideoDownloader:
         self.cookies_file = setup_cookies_file(cookies_file or "cookies.txt")
 
     def _sync_download_spotify(self, url: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
-        """Downloads high quality audio matching a Spotify track using YouTube backend with mobile player client."""
+        """Downloads high quality audio matching a Spotify track using SoundCloud (primary) or YouTube (fallback)."""
         meta = get_spotify_info(url)
         title = meta['title']
         artist = meta['artist']
-        search_query = f"{artist} - {title} audio" if artist and artist != 'Artista Desconocido' else f"{title} audio"
+        search_query = f"{artist} {title}" if artist and artist != 'Artista Desconocido' else title
 
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'format': 'bestaudio/best',
             'outtmpl': output_template,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['default', 'web_safari', 'web_embedded', 'ios', 'android'],
-                }
-            },
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
             'max_filesize': MAX_TELEGRAM_SIZE_BYTES,
         }
 
-        js_cfg = get_js_runtimes_config()
-        if js_cfg:
-            ydl_opts['js_runtimes'] = js_cfg
-
         if self.cookies_file:
             ydl_opts['cookiefile'] = self.cookies_file
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = None
+        ydl_used = None
+
+        # 1. Try SoundCloud first (reliable, 0 IP blocks on cloud datacenter IPs)
+        try:
+            ydl_sc = yt_dlp.YoutubeDL(ydl_opts)
+            sc_info = ydl_sc.extract_info(f"scsearch1:{search_query}", download=True)
+            if sc_info and 'entries' in sc_info and sc_info['entries']:
+                info = sc_info
+                ydl_used = ydl_sc
+        except Exception as e:
+            logger.info(f"SoundCloud search for '{search_query}' failed: {e}")
+
+        # 2. Fallback to YouTube if SoundCloud didn't find the track
+        if not info or not info.get('entries'):
             try:
-                info = ydl.extract_info(f"ytsearch1:{search_query}", download=True)
-            except Exception as e:
-                raise ValueError(f"No se pudo descargar el audio para '{artist} - {title}': {e}")
+                yt_query = f"{artist} - {title} audio" if artist else f"{title} audio"
+                yt_opts = dict(ydl_opts)
+                js_cfg = get_js_runtimes_config()
+                if js_cfg:
+                    yt_opts['js_runtimes'] = js_cfg
+                yt_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
+                ydl_yt = yt_dlp.YoutubeDL(yt_opts)
+                yt_info = ydl_yt.extract_info(f"ytsearch1:{yt_query}", download=True)
+                if yt_info and 'entries' in yt_info and yt_info['entries']:
+                    info = yt_info
+                    ydl_used = ydl_yt
+            except Exception as e2:
+                logger.warning(f"YouTube fallback for '{search_query}' failed: {e2}")
 
-            if not info or 'entries' not in info or not info['entries']:
-                raise ValueError(f"No se encontró el audio para '{artist} - {title}'.")
+        if not info or not info.get('entries'):
+            raise ValueError(f"No se encontró el audio para '{artist} - {title}'.")
 
-            entry = info['entries'][0]
-            base_filename = ydl.prepare_filename(entry)
-            mp3_file = os.path.splitext(base_filename)[0] + '.mp3'
+        entry = info['entries'][0]
+        base_filename = ydl_used.prepare_filename(entry) if ydl_used else ""
+        mp3_file = os.path.splitext(base_filename)[0] + '.mp3' if base_filename else None
 
-            if not os.path.exists(mp3_file):
-                for f in os.listdir(temp_subfolder):
-                    if f.lower().endswith('.mp3'):
-                        mp3_file = os.path.join(temp_subfolder, f)
-                        break
+        if not mp3_file or not os.path.exists(mp3_file):
+            for f in os.listdir(temp_subfolder):
+                if f.lower().endswith('.mp3'):
+                    mp3_file = os.path.join(temp_subfolder, f)
+                    break
 
-            if not os.path.exists(mp3_file):
-                raise FileNotFoundError("No se encontró el archivo MP3 descargado.")
+        if not mp3_file or not os.path.exists(mp3_file):
+            raise FileNotFoundError("No se encontró el archivo MP3 descargado.")
 
-            file_size = os.path.getsize(mp3_file)
-            duration = entry.get('duration') or 0
+        file_size = os.path.getsize(mp3_file)
+        duration = entry.get('duration') or 0
 
-            # Download album cover
-            thumb_file = None
-            if meta.get('thumbnail_url'):
-                thumb_file = os.path.join(temp_subfolder, 'spotify_cover.jpg')
-                try:
-                    urllib.request.urlretrieve(meta['thumbnail_url'], thumb_file)
-                except Exception:
-                    thumb_file = None
+        # Download album cover
+        thumb_file = None
+        if meta.get('thumbnail_url'):
+            thumb_file = os.path.join(temp_subfolder, 'spotify_cover.jpg')
+            try:
+                urllib.request.urlretrieve(meta['thumbnail_url'], thumb_file)
+            except Exception:
+                thumb_file = None
 
-            return {
-                'file_path': mp3_file,
-                'thumbnail_path': thumb_file,
-                'title': title,
-                'artist': artist,
-                'duration': int(duration) if duration else None,
-                'width': None,
-                'height': None,
-                'filesize': file_size,
-                'platform': 'Spotify',
-                'platform_emoji': '🟢',
-                'is_audio': True,
-                'format': 'mp3',
-            }
+        return {
+            'file_path': mp3_file,
+            'thumbnail_path': thumb_file,
+            'title': title,
+            'artist': artist,
+            'duration': int(duration) if duration else None,
+            'width': None,
+            'height': None,
+            'filesize': file_size,
+            'platform': 'Spotify',
+            'platform_emoji': '🟢',
+            'is_audio': True,
+            'format': 'mp3',
+        }
 
     def _sync_download(self, url: str, format_type: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
         """
@@ -347,28 +362,24 @@ class VideoDownloader:
             'http_chunk_size': 10485760,
             'retries': 3,
             'fragment_retries': 5,
-            'http_headers': {
+        }
+
+        # For non-YouTube platforms, set standard User-Agent.
+        # For YouTube, DO NOT override User-Agent so yt-dlp matches internal client signatures.
+        if not is_yt:
+            ydl_opts['http_headers'] = {
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
                     'Chrome/124.0.0.0 Safari/537.36'
                 ),
                 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-            },
-        }
+            }
 
         # JS runtime configuration for n-challenge solving
         js_cfg = get_js_runtimes_config()
         if js_cfg:
             ydl_opts['js_runtimes'] = js_cfg
-
-        # Resilient client configuration for YouTube to avoid bot verification
-        if is_yt:
-            ydl_opts['extractor_args'] = {
-                'youtube': {
-                    'player_client': ['default', 'web_safari', 'web_embedded', 'ios', 'android'],
-                }
-            }
 
         if format_type == 'mp3':
             ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
@@ -389,44 +400,39 @@ class VideoDownloader:
         if self.cookies_file:
             ydl_opts['cookiefile'] = self.cookies_file
 
-        active_ydl = yt_dlp.YoutubeDL(ydl_opts)
-        try:
-            info = active_ydl.extract_info(url, download=True)
-        except Exception as e:
-            err_msg = str(e)
-            if is_yt and ('Sign in to confirm you’re not a bot' in err_msg or 'bot' in err_msg.lower()):
-                # Automatic fallback: retry with mobile/web clients
-                retry_opts = dict(ydl_opts)
-                retry_opts['extractor_args'] = {
-                    'youtube': {
-                        'player_client': ['ios', 'android', 'mweb', 'web_safari'],
-                    }
-                }
-                active_ydl = yt_dlp.YoutubeDL(retry_opts)
-                try:
-                    info = active_ydl.extract_info(url, download=True)
-                except Exception as e2:
-                    err_msg2 = str(e2)
-                    if 'Sign in to confirm you’re not a bot' in err_msg2:
-                        raise ValueError(
-                            "YouTube solicitó verificación de bot para la IP del servidor. "
-                            "Para solucionarlo de forma permanente, añade tus cookies en la variable de entorno YOUTUBE_COOKIES."
-                        )
-                    raise ValueError(f"Error al descargar: {err_msg2}")
-            else:
+        # Execution with sequential client fallbacks for YouTube
+        clients_to_try = [None, ['android'], ['web_safari'], ['mweb']] if is_yt else [None]
+        info = None
+        active_ydl = None
+        last_error = None
+
+        for client in clients_to_try:
+            attempt_opts = dict(ydl_opts)
+            if client:
+                attempt_opts['extractor_args'] = {'youtube': {'player_client': client}}
+            try:
+                active_ydl = yt_dlp.YoutubeDL(attempt_opts)
+                info = active_ydl.extract_info(url, download=True)
+                if info:
+                    break
+            except Exception as e:
+                last_error = e
+                err_msg = str(e)
+                logger.warning(f"Download attempt with client {client} failed: {err_msg}")
                 if 'Private video' in err_msg or 'This video is private' in err_msg:
                     raise ValueError("El video es privado o no está disponible.")
-                elif 'Sign in to confirm you’re not a bot' in err_msg:
-                    raise ValueError(
-                        "YouTube solicitó verificación de bot para la IP del servidor. "
-                        "Para solucionarlo de forma permanente, añade tus cookies en la variable de entorno YOUTUBE_COOKIES."
-                    )
                 elif 'Video unavailable' in err_msg:
                     raise ValueError("El video no está disponible o fue eliminado.")
-                raise ValueError(f"Error al descargar: {err_msg}")
+                continue
 
         if not info:
-            raise ValueError("No se pudo obtener información del enlace proporcionado.")
+            err_text = str(last_error or "Error desconocido")
+            if 'Sign in to confirm you’re not a bot' in err_text or 'bot' in err_text.lower() or 'Failed to extract any player response' in err_text:
+                raise ValueError(
+                    "YouTube ha bloqueado temporalmente las descargas para la IP del servidor en la nube (Render). "
+                    "Para solucionarlo de inmediato, añade tus cookies en la variable de entorno YOUTUBE_COOKIES en Render."
+                )
+            raise ValueError(f"Error al descargar: {err_text}")
 
         if 'entries' in info and info['entries']:
             info = info['entries'][0]
