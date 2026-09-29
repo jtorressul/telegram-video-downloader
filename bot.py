@@ -109,27 +109,76 @@ async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
     return username or ""
 
 
-async def sync_user_vip_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+async def sync_user_vip_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    group_title: Optional[str] = None
+) -> bool:
     """
-    Checks member's custom title in group.
-    If custom_title contains 'VIP' or user is Creator, marks as VIP in DB.
+    Checks member status/custom title in group.
+    - If user is in ADMIN_IDS -> VIP
+    - If user is Creator / Owner of the group -> VIP
+    - If user custom_title contains 'VIP' (e.g. 'DROGUITA - VIP', 'MIYAGIPEOS - VIP') -> VIP
+    - If user is Administrator with title 'ADMIN' or is Group Admin -> VIP
+    - If regular member without VIP title -> NO VIP PASS
     """
+    if chat_id < 0:
+        user_db.register_group(chat_id, group_title)
+
+    if user_id in ADMIN_IDS:
+        user_db.set_vip_status(user_id, True, username, first_name)
+        return True
+
     try:
         member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        is_creator = member.status in [ChatMemberStatus.OWNER] or getattr(member, 'status', None) == 'creator'
-        custom_title = (getattr(member, 'custom_title', '') or '').upper()
+        status = str(getattr(member, 'status', '')).lower()
+        is_creator = status in ['creator', 'owner', ChatMemberStatus.OWNER]
+        is_admin = status in ['administrator', ChatMemberStatus.ADMINISTRATOR]
+        custom_title = (getattr(member, 'custom_title', '') or '').strip().upper()
 
-        if is_creator or 'VIP' in custom_title:
-            user_db.set_vip_status(user_id, True)
+        logger.info(f"Sync VIP chat={chat_id}, user={user_id}: status={status}, title='{custom_title}'")
+
+        if is_creator or 'VIP' in custom_title or 'ADMIN' in custom_title or is_admin:
+            user_db.set_vip_status(user_id, True, username, first_name)
             return True
         else:
-            # If title explicitly doesn't have VIP, demote if they were previously marked via group
-            if custom_title and 'VIP' not in custom_title:
-                user_db.set_vip_status(user_id, False)
-                return False
+            user_db.set_vip_status(user_id, False, username, first_name)
+            return False
     except Exception as e:
-        logger.debug(f"Could not verify VIP status in chat {chat_id} for user {user_id}: {e}")
+        logger.warning(f"No se pudo verificar estado VIP de {user_id} en chat {chat_id}: {e}")
+        user_db.get_or_create_user(user_id, username, first_name)
     return False
+
+
+async def sync_user_vip_from_all_groups(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None
+) -> bool:
+    """Checks VIP status across all known groups when in private chat."""
+    if user_id in ADMIN_IDS:
+        user_db.set_vip_status(user_id, True, username, first_name)
+        return True
+
+    # If already marked VIP in DB, preserve it
+    user = user_db.get_or_create_user(user_id, username, first_name)
+    if user.get('is_vip'):
+        return True
+
+    known_groups = user_db.get_known_groups()
+    for gid in known_groups:
+        try:
+            is_vip = await sync_user_vip_status(context, gid, user_id, username, first_name)
+            if is_vip:
+                return True
+        except Exception:
+            continue
+    return False
+
 
 
 async def keep_chat_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: ChatAction, stop_event: asyncio.Event):
@@ -207,31 +256,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = html.escape(user.first_name) if user and user.first_name else "amigo"
     bot_username = await get_bot_username(context)
 
-    # Handle referral start: /start ref_12345
-    referred_by = None
-    if context.args and context.args[0].startswith("ref_"):
-        try:
-            ref_id_str = context.args[0].split("_")[1]
-            if ref_id_str.isdigit():
-                referred_by = int(ref_id_str)
-        except Exception:
-            pass
-
-    user_db.get_or_create_user(user.id, user.username, user.first_name, referred_by=referred_by)
+    user_db.get_or_create_user(user.id, user.username, user.first_name)
 
     if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        await sync_user_vip_status(context, chat.id, user.id)
+        await sync_user_vip_status(context, chat.id, user.id, user.username, user.first_name, chat.title)
         panel_url = f"https://t.me/{bot_username}?start=help" if bot_username else "https://t.me"
         keyboard = [[InlineKeyboardButton("⚙️ Ver Panel del Bot", url=panel_url)]]
         await update.message.reply_html(
             f"👋 ¡Hola a todos! Soy el bot descargador de videos y música.\n\n"
             "✨ <b>Condiciones del Grupo:</b>\n"
-            f"• 🆓 <b>NO VIP PASS:</b> 10 descargas diarias (X, Instagram, TikTok).\n"
-            f"• 👑 <b>VIP:</b> 20 descargas diarias (Todas las plataformas: YouTube, Facebook, etc.).\n\n"
+            f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas diarias (X, Instagram, TikTok).\n"
+            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas diarias (Todas las plataformas: YouTube, Facebook, etc.).\n\n"
             "🧹 <i>Con permisos de Administrador (Eliminar mensajes), borro los enlaces automáticamente.</i>",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
+
+    await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
 
     welcome_text = (
         f"👋 ¡Hola, <b>{name}</b>!\n\n"
@@ -255,24 +296,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        await sync_user_vip_status(context, chat.id, user.id)
+        await sync_user_vip_status(context, chat.id, user.id, user.username, user.first_name, chat.title)
+    else:
+        await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
 
     stats_text = user_db.get_stats_message(user.id, user.username, user.first_name)
     await update.message.reply_html(stats_text)
-
-
-async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /ref or /referidos command."""
-    user = update.effective_user
-    bot_username = await get_bot_username(context)
-    ref_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
-
-    ref_text = (
-        "👥 <b>Tu Enlace de Referidos:</b>\n\n"
-        f"<code>{ref_link}</code>\n\n"
-        "Comparte este enlace con tus amigos para acumular referidos y créditos en el bot."
-    )
-    await update.message.reply_html(ref_link)
 
 
 async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -409,14 +438,18 @@ async def unvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greets the group when added and explains features."""
+    chat = update.effective_chat
+    if chat and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        user_db.register_group(chat.id, chat.title)
+
     bot_id = context.bot.id
     for member in update.message.new_chat_members:
         if member.id == bot_id:
             await update.message.reply_html(
                 "🎉 <b>¡Hola! Gracias por añadirme a este grupo.</b>\n\n"
                 "📹 Descargaré videos y música automáticamente.\n\n"
-                "💎 <b>Sistema VIP:</b> Los miembros con título '- VIP' en el grupo tienen 20 descargas diarias y acceso a YouTube/Facebook. "
-                "Los miembros estándar tienen 10 descargas diarias en Instagram, TikTok y X.\n\n"
+                f"💎 <b>Sistema VIP:</b> Los miembros con título '- VIP' en el grupo tienen {VIP_DAILY_LIMIT} descargas diarias y acceso a YouTube/Facebook. "
+                f"Los miembros estándar tienen {NO_VIP_DAILY_LIMIT} descargas diarias en Instagram, TikTok y X.\n\n"
                 "💡 Hazme administrador con permiso de <b>'Eliminar mensajes'</b> para activar la auto-limpieza."
             )
             break
@@ -725,7 +758,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        await sync_user_vip_status(context, chat.id, user.id)
+        await sync_user_vip_status(context, chat.id, user.id, user.username, user.first_name, chat.title)
+    else:
+        await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
 
     # 1. Download format selection: dl:mp3:<id> or dl:mp4:<id>
     if data.startswith("dl:"):
@@ -826,7 +861,9 @@ async def direct_format_command(update: Update, context: ContextTypes.DEFAULT_TY
     is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
 
     if is_group:
-        await sync_user_vip_status(context, chat.id, user.id)
+        await sync_user_vip_status(context, chat.id, user.id, user.username, user.first_name, chat.title)
+    else:
+        await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
 
     user_mention = user.mention_html() if user else "Usuario"
 
@@ -860,9 +897,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
 
-    # Sync VIP status in group
+    # Sync VIP status in group or private
     if is_group:
-        await sync_user_vip_status(context, chat.id, user.id)
+        await sync_user_vip_status(context, chat.id, user.id, user.username, user.first_name, chat.title)
+    else:
+        await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
 
     text = update.message.text or update.message.caption or ""
     urls = URL_REGEX.findall(text)
@@ -933,7 +972,6 @@ def main():
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler(["stats", "estadisticas", "perfil"], stats_command))
-    app.add_handler(CommandHandler(["ref", "referidos"], ref_command))
     app.add_handler(CommandHandler(["panel", "grupo", "grupos", "anadir", "agregar", "addgroup"], panel_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))

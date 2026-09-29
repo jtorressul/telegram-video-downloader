@@ -27,7 +27,6 @@ Cada usuario puede consultar sus estadísticas en tiempo real enviando `/stats` 
 📥 Descargas: 14
 📱 Social: 10 | 🌐 Otras: 4
 🗓 Cuota diaria: 14/20 (o 7/10 si es NO VIP)
-🎁 Créditos: 0 | 👥 Referidos: 0
 ```
 
 - **Social:** Contador de descargas de Instagram, TikTok y X.
@@ -48,7 +47,6 @@ Cada usuario puede consultar sus estadísticas en tiempo real enviando `/stats` 
 4. **Comandos de Administración:**
    - `/vip [user_id]` (o respondiendo a un usuario): Activa manualmente el rango VIP.
    - `/unvip [user_id]`: Quita el rango VIP.
-   - `/ref`: Obtiene el enlace de invitación personal para sumar referidos.
 5. **Caché Ultra Rápida (SQLite):**
    - Si un archivo ya fue descargado previamente, se entrega en menos de **0.5 segundos**.
 6. **Listo para la Nube (Render / Koyeb):**

@@ -25,7 +25,7 @@ class UserDatabase:
         return conn
 
     def _init_db(self):
-        """Initializes users table with stats and quota fields."""
+        """Initializes users and groups tables."""
         with self._get_connection() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -38,15 +38,36 @@ class UserDatabase:
                     other_downloads INTEGER DEFAULT 0,
                     daily_downloads INTEGER DEFAULT 0,
                     last_download_date TEXT,
-                    credits INTEGER DEFAULT 0,
-                    referrals INTEGER DEFAULT 0,
-                    referred_by INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS known_groups (
+                    group_id INTEGER PRIMARY KEY,
+                    title TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             conn.commit()
 
-    def get_or_create_user(self, user_id: int, username: Optional[str] = None, first_name: Optional[str] = None, referred_by: Optional[int] = None) -> Dict[str, Any]:
+    def register_group(self, group_id: int, title: Optional[str] = None):
+        """Registers or updates a known group."""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO known_groups (group_id, title, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(group_id) DO UPDATE SET title = excluded.title, updated_at = CURRENT_TIMESTAMP
+            """, (group_id, title or ""))
+            conn.commit()
+
+    def get_known_groups(self) -> list:
+        """Returns list of known group IDs."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT group_id FROM known_groups")
+            return [row[0] for row in cur.fetchall()]
+
+    def get_or_create_user(self, user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Dict[str, Any]:
         """Fetches or registers a user, handling daily quota resets."""
         today_str = date.today().isoformat()
 
@@ -57,16 +78,10 @@ class UserDatabase:
 
             if not row:
                 conn.execute("""
-                    INSERT INTO users (user_id, username, first_name, last_download_date, referred_by)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (user_id, username or "", first_name or "", today_str, referred_by))
+                    INSERT INTO users (user_id, username, first_name, last_download_date)
+                    VALUES (?, ?, ?, ?)
+                """, (user_id, username or "", first_name or "", today_str))
                 conn.commit()
-
-                # If invited by someone, increment referrer count
-                if referred_by and referred_by != user_id:
-                    conn.execute("UPDATE users SET referrals = referrals + 1 WHERE user_id = ?", (referred_by,))
-                    conn.commit()
-
                 cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
                 row = cur.fetchone()
             else:
@@ -95,8 +110,9 @@ class UserDatabase:
 
             return dict(row)
 
-    def set_vip_status(self, user_id: int, is_vip: bool):
-        """Sets VIP status (1 or 0) for a user."""
+    def set_vip_status(self, user_id: int, is_vip: bool, username: Optional[str] = None, first_name: Optional[str] = None):
+        """Sets VIP status (1 or 0) for a user, ensuring the user exists first."""
+        self.get_or_create_user(user_id, username, first_name)
         with self._get_connection() as conn:
             conn.execute("UPDATE users SET is_vip = ? WHERE user_id = ?", (1 if is_vip else 0, user_id))
             conn.commit()
@@ -161,14 +177,11 @@ class UserDatabase:
         other = user.get('other_downloads', 0)
         daily = user.get('daily_downloads', 0)
         max_daily = VIP_DAILY_LIMIT if is_vip else NO_VIP_DAILY_LIMIT
-        credits_count = user.get('credits', 0)
-        referrals_count = user.get('referrals', 0)
 
         return (
             "📊 <b>Tus Estadísticas</b>\n\n"
             f"💎 <b>Estado:</b> {status_text}\n"
             f"📥 <b>Descargas:</b> {total}\n"
             f"📱 <b>Social:</b> {social} | 🌐 <b>Otras:</b> {other}\n"
-            f"🗓 <b>Cuota diaria:</b> {daily}/{max_daily}\n"
-            f"🎁 <b>Créditos:</b> {credits_count} | 👥 <b>Referidos:</b> {referrals_count}"
+            f"🗓 <b>Cuota diaria:</b> {daily}/{max_daily}"
         )
