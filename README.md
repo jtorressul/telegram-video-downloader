@@ -1,6 +1,7 @@
-# 🎬 Bot de Telegram para Descarga de Videos (Instagram, TikTok, Facebook, YouTube)
+# 🎬 Bot de Telegram para Descarga de Videos y Música (Instagram, TikTok, Facebook, YouTube, Spotify)
 
-Bot de Telegram desarrollado en Python capaz de descargar videos automáticamente de múltiples plataformas:
+Bot de Telegram desarrollado en Python capaz de descargar videos y música automáticamente de múltiples plataformas:
+- 🟢 **Spotify:** Canciones completas en formato MP3 con carátula oficial y metadatos (artista y título).
 - 📸 **Instagram:** Reels, videos y publicaciones públicas.
 - 🎵 **TikTok:** Videos en alta calidad y sin marca de agua.
 - 👥 **Facebook:** Reels y videos públicos de páginas y perfiles.

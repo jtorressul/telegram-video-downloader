@@ -191,8 +191,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 ¡Hola, <b>{name}</b>!\n\n"
-        "Soy tu bot para descargar videos de redes sociales a <b>máxima velocidad</b>.\n\n"
+        "Soy tu bot para descargar videos y música a <b>máxima velocidad</b>.\n\n"
         "✨ <b>Plataformas compatibles:</b>\n"
+        "• 🟢 <b>Spotify:</b> Canciones en MP3 con carátula oficial\n"
         "• 📸 <b>Instagram:</b> Reels, videos y publicaciones\n"
         "• 🎵 <b>TikTok:</b> Videos sin marca de agua\n"
         "• 👥 <b>Facebook:</b> Reels y videos públicos\n"
@@ -200,7 +201,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🐦 <b>X (Twitter), Threads, Reddit</b> y más\n\n"
         "👥 <b>¡Añádeme a tus grupos con un solo toque!</b>\n"
         "Usa los botones de abajo para añadirme y activaré la descarga y auto-limpieza de links en tu grupo.\n\n"
-        "📥 <b>O pruébame aquí:</b> Envíame cualquier enlace de video."
+        "📥 <b>O pruébame aquí:</b> Envíame cualquier enlace de video o canción."
     )
 
     await update.message.reply_html(
@@ -403,24 +404,47 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
             clean_title = html.escape(cached_title[:200] + ('...' if len(cached_title) > 200 else ''))
             duration = cached_data.get('duration')
             filesize = cached_data.get('filesize', 0)
+            is_audio = bool(cached_data.get('is_audio'))
+            performer = cached_data.get('performer')
+            clean_artist = html.escape(performer or '')
 
-            caption = (
-                f"🎬 <b>{clean_title}</b>\n\n"
-                f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
-                f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
-                f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
-                f"👤 <b>Pedido por:</b> {user_mention}\n\n"
-                f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
-                f"⚡ <i>Descarga instantánea</i>"
-            )
-
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=cached_data['file_id'],
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                supports_streaming=True,
-            )
+            if is_audio:
+                caption = (
+                    f"🎵 <b>{clean_title}</b>\n"
+                    + (f"🎤 <b>Artista:</b> {clean_artist}\n" if clean_artist else "")
+                    + f"🟢 <b>Plataforma:</b> Spotify\n"
+                    f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
+                    f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
+                    f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                    f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
+                    f"⚡ <i>Descarga instantánea</i>"
+                )
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=cached_data['file_id'],
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    title=cached_title,
+                    performer=performer,
+                    duration=duration,
+                )
+            else:
+                caption = (
+                    f"🎬 <b>{clean_title}</b>\n\n"
+                    f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
+                    f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
+                    f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
+                    f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                    f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
+                    f"⚡ <i>Descarga instantánea</i>"
+                )
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=cached_data['file_id'],
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True,
+                )
 
             # Auto-delete original message with link in groups
             if is_group:
@@ -434,13 +458,15 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
             logger.info(f"Cached video failed to send, downloading fresh: {e}")
 
     # 2. Fresh download
+    item_type = "canción" if emoji == "🟢" else "video"
     status_message = await user_msg.reply_html(
-        f"⏳ {emoji} <b>Procesando video de {platform}...</b>"
+        f"⏳ {emoji} <b>Procesando {item_type} de {platform}...</b>"
     )
 
     stop_chat_action = asyncio.Event()
+    chat_action = ChatAction.UPLOAD_VOICE if emoji == "🟢" else ChatAction.UPLOAD_VIDEO
     chat_action_task = asyncio.create_task(
-        keep_chat_action(context, chat_id, ChatAction.UPLOAD_VIDEO, stop_chat_action)
+        keep_chat_action(context, chat_id, chat_action, stop_chat_action)
     )
 
     download_result = None
@@ -450,7 +476,7 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         try:
             await status_message.edit_text(
-                f"⬆️ {emoji} <b>Subiendo a Telegram...</b>",
+                f"⬆️ {emoji} <b>Subiendo {item_type} a Telegram...</b>",
                 parse_mode=ParseMode.HTML
             )
         except Exception:
@@ -458,54 +484,101 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         file_path = download_result['file_path']
         thumb_path = download_result.get('thumbnail_path')
-        title = download_result.get('title', 'Video')
+        title = download_result.get('title', 'Audio' if emoji == "🟢" else 'Video')
         duration = download_result.get('duration')
         width = download_result.get('width')
         height = download_result.get('height')
         filesize = download_result.get('filesize', 0)
+        is_audio = bool(download_result.get('is_audio'))
+        artist = download_result.get('artist')
+        clean_artist = html.escape(artist or '')
 
         clean_title = html.escape(title[:200] + ('...' if len(title) > 200 else ''))
-        caption = (
-            f"🎬 <b>{clean_title}</b>\n\n"
-            f"{emoji} <b>Plataforma:</b> {platform}\n"
-            f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
-            f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
-            f"👤 <b>Pedido por:</b> {user_mention}\n\n"
-            f"🔗 <a href=\"{clean_url}\">Link original</a>"
-        )
 
-        with open(file_path, 'rb') as video_fp:
-            thumb_fp = open(thumb_path, 'rb') if (thumb_path and os.path.exists(thumb_path)) else None
-            try:
-                sent_msg = await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=video_fp,
-                    thumbnail=thumb_fp,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    duration=duration,
-                    width=width,
-                    height=height,
-                    supports_streaming=True,
-                    read_timeout=300,
-                    write_timeout=300,
-                )
-
-                # Save file_id to cache
-                if sent_msg and sent_msg.video:
-                    cache.set(
-                        url=url,
-                        file_id=sent_msg.video.file_id,
+        if is_audio:
+            caption = (
+                f"🎵 <b>{clean_title}</b>\n"
+                + (f"🎤 <b>Artista:</b> {clean_artist}\n" if clean_artist else "")
+                + f"🟢 <b>Plataforma:</b> Spotify\n"
+                f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
+                f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
+                f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                f"🔗 <a href=\"{clean_url}\">Link original</a>"
+            )
+            with open(file_path, 'rb') as audio_fp:
+                thumb_fp = open(thumb_path, 'rb') if (thumb_path and os.path.exists(thumb_path)) else None
+                try:
+                    sent_msg = await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio_fp,
+                        thumbnail=thumb_fp,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
                         title=title,
-                        platform=platform,
+                        performer=artist,
+                        duration=duration,
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
+                    if sent_msg and sent_msg.audio:
+                        cache.set(
+                            url=url,
+                            file_id=sent_msg.audio.file_id,
+                            title=title,
+                            platform='Spotify',
+                            duration=duration,
+                            width=None,
+                            height=None,
+                            filesize=filesize,
+                            is_audio=True,
+                            performer=artist,
+                        )
+                finally:
+                    if thumb_fp:
+                        thumb_fp.close()
+        else:
+            caption = (
+                f"🎬 <b>{clean_title}</b>\n\n"
+                f"{emoji} <b>Plataforma:</b> {platform}\n"
+                f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
+                f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
+                f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+                f"🔗 <a href=\"{clean_url}\">Link original</a>"
+            )
+
+            with open(file_path, 'rb') as video_fp:
+                thumb_fp = open(thumb_path, 'rb') if (thumb_path and os.path.exists(thumb_path)) else None
+                try:
+                    sent_msg = await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=video_fp,
+                        thumbnail=thumb_fp,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
                         duration=duration,
                         width=width,
                         height=height,
-                        filesize=filesize,
+                        supports_streaming=True,
+                        read_timeout=300,
+                        write_timeout=300,
                     )
-            finally:
-                if thumb_fp:
-                    thumb_fp.close()
+
+                    # Save file_id to cache
+                    if sent_msg and sent_msg.video:
+                        cache.set(
+                            url=url,
+                            file_id=sent_msg.video.file_id,
+                            title=title,
+                            platform=platform,
+                            duration=duration,
+                            width=width,
+                            height=height,
+                            filesize=filesize,
+                            is_audio=False,
+                        )
+                finally:
+                    if thumb_fp:
+                        thumb_fp.close()
 
         # Delete status message
         try:

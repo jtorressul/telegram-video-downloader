@@ -54,21 +54,32 @@ class VideoCache:
                     width INTEGER,
                     height INTEGER,
                     filesize INTEGER,
+                    is_audio INTEGER DEFAULT 0,
+                    performer TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Safe migration for existing DB
+            try:
+                conn.execute("ALTER TABLE video_cache ADD COLUMN is_audio INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE video_cache ADD COLUMN performer TEXT")
+            except Exception:
+                pass
             conn.commit()
 
     def get(self, url: str) -> Optional[Dict[str, Any]]:
         """
-        Retrieves cached video metadata and Telegram file_id by URL.
+        Retrieves cached video/audio metadata and Telegram file_id by URL.
         """
         key = normalize_url(url)
         try:
             with self._get_connection() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT file_id, title, platform, duration, width, height, filesize FROM video_cache WHERE url_key = ?",
+                    "SELECT file_id, title, platform, duration, width, height, filesize, is_audio, performer FROM video_cache WHERE url_key = ?",
                     (key,)
                 )
                 row = cur.fetchone()
@@ -78,17 +89,17 @@ class VideoCache:
             logger.warning(f"Error reading cache for {url}: {e}")
         return None
 
-    def set(self, url: str, file_id: str, title: str, platform: str, duration: Optional[int], width: Optional[int], height: Optional[int], filesize: int):
+    def set(self, url: str, file_id: str, title: str, platform: str, duration: Optional[int], width: Optional[int], height: Optional[int], filesize: int, is_audio: bool = False, performer: Optional[str] = None):
         """
-        Saves Telegram file_id and metadata for a video URL.
+        Saves Telegram file_id and metadata for a video/audio URL.
         """
         key = normalize_url(url)
         try:
             with self._get_connection() as conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO video_cache (url_key, file_id, title, platform, duration, width, height, filesize)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (key, file_id, title, platform, duration, width, height, filesize))
+                    INSERT OR REPLACE INTO video_cache (url_key, file_id, title, platform, duration, width, height, filesize, is_audio, performer)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (key, file_id, title, platform, duration, width, height, filesize, 1 if is_audio else 0, performer))
                 conn.commit()
         except Exception as e:
             logger.warning(f"Error saving to cache for {url}: {e}")

@@ -1,10 +1,12 @@
 import os
 import re
+import json
 import glob
 import shutil
 import tempfile
 import asyncio
 import subprocess
+import urllib.request
 from typing import Dict, Any, Optional, Tuple
 import yt_dlp
 
@@ -30,7 +32,9 @@ def detect_platform(url: str) -> Tuple[str, str]:
     Returns (Platform Name, Emoji).
     """
     url_lower = url.lower()
-    if any(k in url_lower for k in ['tiktok.com']):
+    if any(k in url_lower for k in ['spotify.com', 'spotify.link']):
+        return "Spotify", "🟢"
+    elif any(k in url_lower for k in ['tiktok.com']):
         return "TikTok", "🎵"
     elif any(k in url_lower for k in ['instagram.com', 'instagr.am']):
         return "Instagram", "📸"
@@ -114,15 +118,139 @@ def compress_video_ffmpeg(input_file: str, output_file: str, duration: float) ->
     return False
 
 
+def get_spotify_info(url: str) -> Dict[str, str]:
+    """Extracts track title, artist, and cover art from a Spotify URL."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            final_url = resp.geturl()
+    except Exception:
+        final_url = url
+
+    title = ""
+    thumbnail_url = ""
+    artist = ""
+
+    # 1. Try Spotify oEmbed
+    try:
+        oembed_url = f"https://open.spotify.com/oembed?url={final_url}"
+        req_oe = urllib.request.Request(oembed_url, headers=headers)
+        with urllib.request.urlopen(req_oe, timeout=10) as oe_resp:
+            oe_data = json.loads(oe_resp.read().decode('utf-8'))
+            title = oe_data.get('title', '')
+            thumbnail_url = oe_data.get('thumbnail_url', '')
+    except Exception:
+        pass
+
+    # 2. Extract track id and fetch embed page for artist
+    track_match = re.search(r'track/([a-zA-Z0-9]+)', final_url)
+    if track_match:
+        track_id = track_match.group(1)
+        embed_url = f"https://open.spotify.com/embed/track/{track_id}"
+        try:
+            req_embed = urllib.request.Request(embed_url, headers=headers)
+            with urllib.request.urlopen(req_embed, timeout=10) as em_resp:
+                html_data = em_resp.read().decode('utf-8')
+                m = re.search(r'<script id=\"__NEXT_DATA__\"[^>]*>([^<]+)</script>', html_data)
+                if m:
+                    parsed = json.loads(m.group(1))
+                    entity = parsed['props']['pageProps']['state']['data']['entity']
+                    artists = entity.get('artists', [])
+                    if artists:
+                        artist = ', '.join([a.get('name') for a in artists if a.get('name')])
+                    if not title:
+                        title = entity.get('name', '')
+        except Exception:
+            pass
+
+    return {
+        'title': title or 'Canción de Spotify',
+        'artist': artist or 'Artista Desconocido',
+        'thumbnail_url': thumbnail_url
+    }
+
+
 class VideoDownloader:
     def __init__(self, temp_dir: Optional[str] = None, cookies_file: Optional[str] = None):
         self.temp_dir = temp_dir or tempfile.gettempdir()
         self.cookies_file = cookies_file if (cookies_file and os.path.exists(cookies_file)) else None
 
+    def _sync_download_spotify(self, url: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
+        """Downloads high quality audio matching a Spotify track."""
+        meta = get_spotify_info(url)
+        title = meta['title']
+        artist = meta['artist']
+        search_query = f"{artist} - {title} audio" if artist != 'Artista Desconocido' else f"{title} audio"
+
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'outtmpl': output_template,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'max_filesize': MAX_TELEGRAM_SIZE_BYTES,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(f"ytsearch1:{search_query}", download=True)
+            except Exception as e:
+                raise ValueError(f"No se pudo descargar el audio para '{artist} - {title}': {e}")
+
+            if not info or 'entries' not in info or not info['entries']:
+                raise ValueError(f"No se encontró el audio para '{artist} - {title}'.")
+
+            entry = info['entries'][0]
+            base_filename = ydl.prepare_filename(entry)
+            mp3_file = os.path.splitext(base_filename)[0] + '.mp3'
+
+            if not os.path.exists(mp3_file):
+                for f in os.listdir(temp_subfolder):
+                    if f.lower().endswith('.mp3'):
+                        mp3_file = os.path.join(temp_subfolder, f)
+                        break
+
+            if not os.path.exists(mp3_file):
+                raise FileNotFoundError("No se encontró el archivo MP3 descargado.")
+
+            file_size = os.path.getsize(mp3_file)
+            duration = entry.get('duration') or 0
+
+            # Download album cover
+            thumb_file = None
+            if meta.get('thumbnail_url'):
+                thumb_file = os.path.join(temp_subfolder, 'spotify_cover.jpg')
+                try:
+                    urllib.request.urlretrieve(meta['thumbnail_url'], thumb_file)
+                except Exception:
+                    thumb_file = None
+
+            return {
+                'file_path': mp3_file,
+                'thumbnail_path': thumb_file,
+                'title': title,
+                'artist': artist,
+                'duration': int(duration) if duration else None,
+                'width': None,
+                'height': None,
+                'filesize': file_size,
+                'platform': 'Spotify',
+                'platform_emoji': '🟢',
+                'is_audio': True,
+            }
+
     def _sync_download(self, url: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
         """
         Synchronous download execution using yt-dlp.
         """
+        if any(k in url.lower() for k in ['spotify.com', 'spotify.link']):
+            return self._sync_download_spotify(url, output_template, temp_subfolder)
         ydl_opts: Dict[str, Any] = {
             'outtmpl': output_template,
             # Best mp4 or webm, prefer compatible codecs
