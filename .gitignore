@@ -27,7 +27,10 @@ temp/
 *.webp
 *.png
 
-# SQLite Cache
+# SQLite Databases
+*.db
+*.db-journal
 cache.db
-cache.db-journal
+bot_users.db
+
 

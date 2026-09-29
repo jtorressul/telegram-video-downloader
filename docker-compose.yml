@@ -7,3 +7,5 @@ services:
       - .env
     volumes:
       - ./cache.db:/app/cache.db
+      - ./bot_users.db:/app/bot_users.db
+

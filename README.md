@@ -1,40 +1,67 @@
-# 🎬 Bot de Telegram: YouTube & YouTube Music Downloader (MP3 & MP4)
+# 🎬 Bot de Telegram: Descargador Multi-Plataforma con Sistema VIP y Estadísticas
 
-Bot de Telegram desarrollado en Python especializado en descargar de **YouTube** y **YouTube Music**:
-- 🎵 **MP3 (Audio):** Canciones y audios en alta calidad (192 kbps) con carátula oficial y etiquetas de artista.
-- 🎬 **MP4 (Video):** Videos en alta resolución optimizados para Telegram (hasta 50 MB con compresión automática).
+Bot de Telegram desarrollado en Python para descargar videos y música en alta calidad con sistema integrado de membresías **VIP vs NO VIP PASS**, control de cuotas diarias y estadísticas personales.
+
+---
+
+## 👑 Sistema de Membresías y Límites
+
+| Rango | Estado en `/stats` | Cuota Diaria | Plataformas Permitidas |
+| :--- | :--- | :--- | :--- |
+| 🆓 **NO VIP** | `NO VIP PASS` | **10 descargas / día** | 📸 **Instagram**, 🎵 **TikTok**, 🐦 **X (Twitter)** |
+| 👑 **VIP** | `VIP` | **20 descargas / día** | 🌐 **Todas** (▶️ YouTube MP3/MP4, 👥 Facebook, IG, TikTok, X) |
+
+### 🔍 Detección Automática de VIP en Grupos:
+El bot detecta automáticamente a los miembros VIP si su **Título Personalizado (Custom Title)** en el grupo de Telegram contiene la palabra **`VIP`** (por ejemplo: `DROGUITA - VIP`, `SIN SOMBRA - VIP`, `ALFREDO PC - VIP`), o si son los creadores del grupo. ¡Cero configuración manual requerida!
+
+---
+
+## 📊 Estadísticas Personales (`/stats`)
+
+Cada usuario puede consultar sus estadísticas en tiempo real enviando `/stats` o `/estadisticas`:
+
+```text
+📊 Tus Estadísticas
+
+💎 Estado: VIP (o NO VIP PASS)
+📥 Descargas: 14
+📱 Social: 10 | 🌐 Otras: 4
+🗓 Cuota diaria: 14/20 (o 7/10 si es NO VIP)
+🎁 Créditos: 0 | 👥 Referidos: 0
+```
+
+- **Social:** Contador de descargas de Instagram, TikTok y X.
+- **Otras:** Contador de descargas de YouTube, Facebook, etc.
+- **Cuota diaria:** Se reinicia automáticamente cada día a la medianoche (00:00).
 
 ---
 
 ## ✨ Características Principales
 
-1. **Selector Interactivo de Formato:** Al enviar cualquier enlace de YouTube o YouTube Music, el bot muestra dos botones:
-   - `[ 🎵 Descargar MP3 (Audio) ]`
-   - `[ 🎬 Descargar MP4 (Video) ]`
-2. **Comandos Directos:**
-   - `/mp3 [enlace]` - Descarga directamente en audio MP3.
-   - `/mp4 [enlace]` - Descarga directamente en video MP4.
-   - `/dl [enlace]` - Muestra el selector de formato.
-3. **Anti-Bloqueo de YouTube:**
-   - Emula clientes oficiales (Android / iOS) para evitar los bloqueos de *"Sign in to confirm you're not a bot"*.
-4. **Optimizado para Grupos:**
-   - Botón directo para añadir a grupos con permisos de Administrador.
-   - **Auto-eliminación:** Elimina el mensaje del enlace original en grupos tras enviar el archivo descargado.
-   - Modo silencioso contra spam de mensajes normales.
+1. **Selector MP3 / MP4:**
+   - Para enlaces de YouTube, muestra botones para elegir entre **🎵 Descargar MP3** (Audio 192k con carátula) o **🎬 Descargar MP4** (Video en HD).
+2. **Auto-Eliminación en Grupos:**
+   - Si el bot tiene permisos de Administrador (*Eliminar mensajes*), borra automáticamente el enlace original del chat una vez enviado el video/música.
+3. **Control de Restricciones:**
+   - Si un usuario `NO VIP PASS` intenta descargar de YouTube o Facebook, el bot le informa que esas plataformas son exclusivas para miembros VIP.
+   - Si se supera el límite diario (10 o 20 descargas), notifica el reinicio a las 00:00.
+4. **Comandos de Administración:**
+   - `/vip [user_id]` (o respondiendo a un usuario): Activa manualmente el rango VIP.
+   - `/unvip [user_id]`: Quita el rango VIP.
+   - `/ref`: Obtiene el enlace de invitación personal para sumar referidos.
 5. **Caché Ultra Rápida (SQLite):**
-   - Si un usuario pide una canción o video ya descargado, se reenvía en **menos de 0.5 segundos**.
-6. **24/7 en la Nube (Render / Koyeb):**
-   - Incluye microservidor web interno en `$PORT` y `Dockerfile` para funcionar en la nube sin costo.
+   - Si un archivo ya fue descargado previamente, se entrega en menos de **0.5 segundos**.
+6. **Listo para la Nube (Render / Koyeb):**
+   - Incluye microservidor web interno en `$PORT` y `Dockerfile` para funcionar 24/7.
 
 ---
 
-## 🛠️ Instalación y Configuración Local
+## 🛠️ Configuración y Ejecución
 
-1. Configura tu token en `.env`:
-   ```env
-   TELEGRAM_BOT_TOKEN=tu_token_de_botfather
-   ```
-2. Ejecuta el script:
-   ```bash
-   ./run.sh
-   ```
+```bash
+# 1. Configura tu token en .env
+TELEGRAM_BOT_TOKEN=tu_token_aqui
+
+# 2. Inicia el bot
+./run.sh
+```

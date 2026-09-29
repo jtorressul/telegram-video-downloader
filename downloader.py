@@ -5,7 +5,6 @@ import shutil
 import tempfile
 import asyncio
 import subprocess
-import urllib.request
 from typing import Dict, Any, Optional, Tuple
 import yt_dlp
 
@@ -41,11 +40,26 @@ def format_duration(seconds: Optional[int]) -> str:
 
 
 def detect_platform(url: str) -> Tuple[str, str]:
-    """Identifies if it's YouTube Music or standard YouTube."""
+    """Identifies the platform and corresponding emoji."""
     url_lower = url.lower()
-    if 'music.youtube.com' in url_lower:
+    if any(k in url_lower for k in ['tiktok.com']):
+        return "TikTok", "🎵"
+    elif any(k in url_lower for k in ['instagram.com', 'instagr.am']):
+        return "Instagram", "📸"
+    elif any(k in url_lower for k in ['twitter.com', 'x.com']):
+        return "X (Twitter)", "🐦"
+    elif 'music.youtube.com' in url_lower:
         return "YouTube Music", "🎵"
-    return "YouTube", "▶️"
+    elif any(k in url_lower for k in ['youtube.com', 'youtu.be']):
+        return "YouTube", "▶️"
+    elif any(k in url_lower for k in ['facebook.com', 'fb.watch', 'fb.com']):
+        return "Facebook", "👥"
+    elif 'reddit.com' in url_lower:
+        return "Reddit", "🤖"
+    elif 'threads.net' in url_lower:
+        return "Threads", "🧵"
+    else:
+        return "Web Video", "🌐"
 
 
 def convert_thumbnail_to_jpg(thumb_path: Optional[str], video_path: str, output_dir: str) -> Optional[str]:
@@ -116,75 +130,60 @@ class VideoDownloader:
     def _sync_download(self, url: str, format_type: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
         """
         Synchronous download execution using yt-dlp.
-        format_type can be 'mp3' or 'mp4'.
+        Supports YouTube (MP3/MP4), TikTok, Instagram, X (Twitter), Facebook, etc.
         """
         format_type = format_type.lower().strip()
         if format_type not in ['mp3', 'mp4']:
             format_type = 'mp4'
 
         platform_name, platform_emoji = detect_platform(url)
+        is_yt = is_youtube_url(url)
+
+        ydl_opts: Dict[str, Any] = {
+            'outtmpl': output_template,
+            'writethumbnail': True,
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'max_filesize': MAX_TELEGRAM_SIZE_BYTES,
+            'concurrent_fragment_downloads': 8,
+            'socket_timeout': 15,
+            'http_chunk_size': 10485760,
+            'retries': 3,
+            'fragment_retries': 5,
+            'http_headers': {
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/124.0.0.0 Safari/537.36'
+                ),
+                'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+            },
+        }
+
+        # Mobile client impersonation for YouTube to avoid bot checks
+        if is_yt:
+            ydl_opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': ['android', 'ios'],
+                }
+            }
 
         if format_type == 'mp3':
-            ydl_opts: Dict[str, Any] = {
-                'outtmpl': output_template,
-                'format': 'bestaudio[ext=m4a]/bestaudio/best',
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'ios'],
-                    }
-                },
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'writethumbnail': True,
-                'noplaylist': True,
-                'quiet': True,
-                'no_warnings': True,
-                'max_filesize': MAX_TELEGRAM_SIZE_BYTES,
-                'http_headers': {
-                    'User-Agent': (
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/124.0.0.0 Safari/537.36'
-                    ),
-                    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-                },
-            }
+            ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
         else:
-            ydl_opts: Dict[str, Any] = {
-                'outtmpl': output_template,
-                'format': (
-                    'bestvideo[ext=mp4][vcodec^=avc1][filesize<48M]+bestaudio[ext=m4a]/'
-                    'bestvideo[filesize<45M]+bestaudio[filesize<5M]/'
-                    'best[filesize<49M][ext=mp4]/'
-                    'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
-                ),
-                'merge_output_format': 'mp4',
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'ios'],
-                    }
-                },
-                'writethumbnail': True,
-                'noplaylist': True,
-                'quiet': True,
-                'no_warnings': True,
-                'concurrent_fragment_downloads': 8,
-                'socket_timeout': 15,
-                'http_chunk_size': 10485760,
-                'retries': 3,
-                'fragment_retries': 5,
-                'http_headers': {
-                    'User-Agent': (
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/124.0.0.0 Safari/537.36'
-                    ),
-                    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-                },
-            }
+            ydl_opts['format'] = (
+                'bestvideo[ext=mp4][vcodec^=avc1][filesize<48M]+bestaudio[ext=m4a]/'
+                'bestvideo[filesize<45M]+bestaudio[filesize<5M]/'
+                'best[filesize<49M][ext=mp4]/'
+                'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+            )
+            ydl_opts['merge_output_format'] = 'mp4'
 
         if self.cookies_file:
             ydl_opts['cookiefile'] = self.cookies_file
@@ -197,19 +196,19 @@ class VideoDownloader:
                 if 'Private video' in err_msg or 'This video is private' in err_msg:
                     raise ValueError("El video es privado o no está disponible.")
                 elif 'Sign in to confirm you’re not a bot' in err_msg:
-                    raise ValueError("YouTube solicitó verificación. Intenta nuevamente en unos instantes.")
+                    raise ValueError("La plataforma solicitó verificación de bot. Reintenta en unos instantes.")
                 elif 'Video unavailable' in err_msg:
-                    raise ValueError("El video no está disponible o fue eliminado de YouTube.")
+                    raise ValueError("El video no está disponible o fue eliminado.")
                 raise ValueError(f"Error al descargar: {err_msg}")
 
             if not info:
-                raise ValueError("No se pudo obtener información del enlace de YouTube.")
+                raise ValueError("No se pudo obtener información del enlace proporcionado.")
 
             if 'entries' in info and info['entries']:
                 info = info['entries'][0]
 
-            title = info.get('title', 'YouTube Media')
-            uploader = info.get('uploader') or info.get('channel') or 'YouTube'
+            title = info.get('title', 'Video')
+            uploader = info.get('uploader') or info.get('channel') or platform_name
             duration = info.get('duration', 0) or 0
             width = info.get('width')
             height = info.get('height')
@@ -218,7 +217,6 @@ class VideoDownloader:
             result_file = None
 
             if format_type == 'mp3':
-                # Look for MP3 file
                 target_mp3 = os.path.splitext(base_filename)[0] + '.mp3'
                 if os.path.exists(target_mp3):
                     result_file = target_mp3
@@ -246,7 +244,7 @@ class VideoDownloader:
                             break
 
             if not result_file or not os.path.exists(result_file):
-                raise FileNotFoundError(f"No se encontró el archivo {format_type.upper()} descargado.")
+                raise FileNotFoundError(f"No se encontró el archivo descargado.")
 
             file_size = os.path.getsize(result_file)
 
@@ -291,9 +289,7 @@ class VideoDownloader:
             }
 
     async def download(self, url: str, format_type: str = "mp4") -> Dict[str, Any]:
-        """
-        Asynchronously downloads YouTube media in MP3 or MP4.
-        """
+        """Asynchronously downloads media."""
         temp_subfolder = tempfile.mkdtemp(dir=self.temp_dir, prefix="tgbot_")
         output_template = os.path.join(temp_subfolder, '%(id)s.%(ext)s')
 
