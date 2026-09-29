@@ -138,8 +138,8 @@ class UserDatabase:
 
         return True, "ok", user
 
-    def record_download_success(self, user_id: int, platform: str):
-        """Increments download stats and daily quota."""
+    def record_download_success(self, user_id: int, platform: str, is_group: bool = False):
+        """Increments download stats and daily quota (quota only incremented for group downloads)."""
         today_str = date.today().isoformat()
         is_social = 1 if platform in SOCIAL_PLATFORMS else 0
 
@@ -148,6 +148,8 @@ class UserDatabase:
             daily_used = user.get('daily_downloads', 0)
             if user.get('last_download_date') != today_str:
                 daily_used = 0
+
+            new_daily = (daily_used + 1) if is_group else daily_used
 
             conn.execute("""
                 UPDATE users SET
@@ -160,7 +162,7 @@ class UserDatabase:
             """, (
                 1 if is_social else 0,
                 0 if is_social else 1,
-                daily_used + 1,
+                new_daily,
                 today_str,
                 user_id
             ))
@@ -175,13 +177,17 @@ class UserDatabase:
         total = user.get('total_downloads', 0)
         social = user.get('social_downloads', 0)
         other = user.get('other_downloads', 0)
+        today_str = date.today().isoformat()
         daily = user.get('daily_downloads', 0)
+        if user.get('last_download_date') != today_str:
+            daily = 0
         max_daily = VIP_DAILY_LIMIT if is_vip else NO_VIP_DAILY_LIMIT
 
         return (
             "📊 <b>Tus Estadísticas</b>\n\n"
             f"💎 <b>Estado:</b> {status_text}\n"
-            f"📥 <b>Descargas:</b> {total}\n"
+            f"📥 <b>Descargas totales:</b> {total}\n"
             f"📱 <b>Social:</b> {social} | 🌐 <b>Otras:</b> {other}\n"
-            f"🗓 <b>Cuota diaria:</b> {daily}/{max_daily}"
+            f"🗓 <b>Cuota diaria (grupo):</b> {daily}/{max_daily}\n\n"
+            "⚡ <i>Las descargas por chat privado son libres e ilimitadas.</i>"
         )
