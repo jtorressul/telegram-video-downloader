@@ -1246,23 +1246,21 @@ class VideoDownloader:
             if is_yt:
                 has_cookies = bool(self.cookies_file and os.path.exists(self.cookies_file))
                 attempts = []
-                # 1. VisionOS client (Bypasses YouTube datacenter/cloud IP bot blocks on Render/VPS without cookies)
-                attempts.append(("visionos (sin cookies)", ['visionos'], False))
-                # 2. Android VR client (Resilient fallback for datacenter IPs)
-                attempts.append(("android_vr (sin cookies)", ['android_vr'], False))
-                # 3. If cookies are provided, try with cookies (for age-restricted or private videos)
+                # 1. If cookies are provided, try with cookies FIRST (essential for datacenter IPs like Render / VPS)
                 if has_cookies:
                     attempts.append(("default (con cookies)", None, True))
+                    attempts.append(("web (con cookies)", ['web'], True))
+                # 2. VisionOS client (Resilient client without cookies)
+                attempts.append(("visionos (sin cookies)", ['visionos'], False))
+                # 3. Android VR client
+                attempts.append(("android_vr (sin cookies)", ['android_vr'], False))
                 # 4. Clean default client WITHOUT cookies
                 attempts.append(("default (sin cookies)", None, False))
                 # 5. Android client WITHOUT cookies
                 attempts.append(("android (sin cookies)", ['android'], False))
                 # 6. Web client WITHOUT cookies
                 attempts.append(("web (sin cookies)", ['web'], False))
-                # 7. Web client with cookies (if cookies exist)
-                if has_cookies:
-                    attempts.append(("web (con cookies)", ['web'], True))
-                # 8. iOS client WITHOUT cookies
+                # 7. iOS client WITHOUT cookies
                 attempts.append(("ios (sin cookies)", ['ios'], False))
             else:
                 attempts = [("default", None, bool(self.cookies_file))]
