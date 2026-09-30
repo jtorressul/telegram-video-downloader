@@ -937,11 +937,13 @@ def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
 
 
 def get_js_runtimes_config() -> Optional[Dict[str, Any]]:
-    """Detects available JS runtime (node/deno) for yt-dlp challenge solving."""
+    """Detects available JS runtime (node/deno/bun) for yt-dlp challenge solving."""
     node_path = shutil.which("node") or shutil.which("nodejs")
     if not node_path:
         nvm_patterns = [
             os.path.expanduser("~/.nvm/versions/node/*/bin/node"),
+            "/var/home/*/.nvm/versions/node/*/bin/node",
+            "/home/*/.nvm/versions/node/*/bin/node",
             "/usr/local/bin/node",
             "/usr/bin/node",
             "/usr/bin/nodejs",
@@ -961,12 +963,42 @@ def get_js_runtimes_config() -> Optional[Dict[str, Any]]:
 
     deno_path = shutil.which("deno")
     if not deno_path:
-        for p in [os.path.expanduser("~/.deno/bin/deno"), "/usr/local/bin/deno", "/usr/bin/deno"]:
-            if os.path.isfile(p) and os.access(p, os.X_OK):
-                deno_path = p
+        for p in [
+            os.path.expanduser("~/.deno/bin/deno"),
+            "/var/home/*/.deno/bin/deno",
+            "/home/*/.deno/bin/deno",
+            "/usr/local/bin/deno",
+            "/usr/bin/deno",
+        ]:
+            matches = glob.glob(p) if '*' in p else ([p] if os.path.exists(p) else [])
+            for cand in matches:
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    deno_path = cand
+                    break
+            if deno_path:
                 break
     if deno_path:
         return {'deno': {'path': deno_path}}
+
+    bun_path = shutil.which("bun")
+    if not bun_path:
+        for p in [
+            os.path.expanduser("~/.bun/bin/bun"),
+            "/var/home/*/.bun/bin/bun",
+            "/home/*/.bun/bin/bun",
+            "/usr/local/bin/bun",
+            "/usr/bin/bun",
+        ]:
+            matches = glob.glob(p) if '*' in p else ([p] if os.path.exists(p) else [])
+            for cand in matches:
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    bun_path = cand
+                    break
+            if bun_path:
+                break
+    if bun_path:
+        return {'bun': {'path': bun_path}}
+
     return None
 
 
@@ -1018,6 +1050,7 @@ class VideoDownloader:
             try:
                 yt_query = f"{artist} - {title} audio" if artist else f"{title} audio"
                 yt_opts = dict(ydl_opts)
+                yt_opts.pop('cookiefile', None)
                 js_cfg = get_js_runtimes_config()
                 if js_cfg:
                     yt_opts['js_runtimes'] = js_cfg
@@ -1205,25 +1238,55 @@ class VideoDownloader:
                     raise ValueError(f"No se pudo descargar el contenido de Instagram: {e_ig_fallback}")
 
         else:
-            # Execution with sequential client fallbacks for YouTube (None/default first with JS runtime)
-            clients_to_try = [None, ['ios'], ['web_safari'], ['mweb'], ['android']] if is_yt else [None]
+            # Execution with sequential client and cookie fallbacks for YouTube
+            # Note: Certain clients like 'android', 'ios' do NOT support cookies in yt-dlp and will be skipped
+            # if cookiefile is present. Furthermore, if cookies are expired, flagged, or in SABR experiment,
+            # YouTube responds with "The page needs to be reloaded" or returns 0 formats.
+            # Therefore, we try with cookies (if available), then clean attempts without cookies, and across clients.
+            if is_yt:
+                has_cookies = bool(self.cookies_file and os.path.exists(self.cookies_file))
+                attempts = []
+                # 1. If cookies are provided, try default client with cookies (for age-restricted or private videos)
+                if has_cookies:
+                    attempts.append(("default (con cookies)", None, True))
+                # 2. Clean default client WITHOUT cookies (bypasses expired, reload-flagged, or SABR-restricted cookies)
+                attempts.append(("default (sin cookies)", None, False))
+                # 3. Android client WITHOUT cookies (android never supports cookies, highly resilient)
+                attempts.append(("android (sin cookies)", ['android'], False))
+                # 4. Web client WITHOUT cookies
+                attempts.append(("web (sin cookies)", ['web'], False))
+                # 5. Web client with cookies (if cookies exist)
+                if has_cookies:
+                    attempts.append(("web (con cookies)", ['web'], True))
+                # 6. iOS client WITHOUT cookies
+                attempts.append(("ios (sin cookies)", ['ios'], False))
+            else:
+                attempts = [("default", None, bool(self.cookies_file))]
+
             info = None
             active_ydl = None
             last_error = None
 
-            for client in clients_to_try:
+            for attempt_name, client, use_cookies in attempts:
                 attempt_opts = dict(ydl_opts)
+                if not use_cookies:
+                    attempt_opts.pop('cookiefile', None)
                 if client:
                     attempt_opts['extractor_args'] = {'youtube': {'player_client': client}}
+                    # Ensure clients that do not support cookies never receive a cookiefile
+                    if any(c in ('android', 'ios', 'visionos', 'android_vr') for c in client):
+                        attempt_opts.pop('cookiefile', None)
+
                 try:
                     active_ydl = yt_dlp.YoutubeDL(attempt_opts)
                     info = active_ydl.extract_info(url, download=True)
                     if info:
+                        logger.info(f"✅ Descarga exitosa de YouTube usando estrategia: {attempt_name}")
                         break
                 except Exception as e:
                     last_error = e
                     err_msg = str(e)
-                    logger.warning(f"Download attempt with client {client} failed: {err_msg}")
+                    logger.warning(f"Download attempt '{attempt_name}' failed: {err_msg}")
                     if 'Private video' in err_msg or 'This video is private' in err_msg:
                         raise ValueError("El video es privado o no está disponible.")
                     elif 'Video unavailable' in err_msg:
@@ -1232,10 +1295,16 @@ class VideoDownloader:
 
         if not info:
             err_text = str(last_error or "Error desconocido")
-            if 'Sign in to confirm you’re not a bot' in err_text or 'bot' in err_text.lower() or 'Failed to extract any player response' in err_text:
+            err_lower = err_text.lower()
+            if any(k in err_lower for k in ['sign in to confirm your age', 'inappropriate for some users', 'age-restricted', 'restricción de edad']):
+                raise ValueError(
+                    "🔒 Este video de YouTube tiene restricción de edad (+18) o requiere inicio de sesión.\n\n"
+                    "💡 Para descargarlo: Envía tu archivo cookies.txt al bot o usa el comando /set_yt."
+                )
+            elif 'sign in to confirm you’re not a bot' in err_lower or 'bot' in err_lower or 'failed to extract any player response' in err_lower:
                 raise ValueError(
                     "YouTube ha bloqueado temporalmente las descargas para la IP del servidor en la nube (Render). "
-                    "Para solucionarlo de inmediato, añade tus cookies en la variable de entorno YOUTUBE_COOKIES en Render."
+                    "Para solucionarlo de inmediato, añade tus cookies en la variable de entorno YOUTUBE_COOKIES en Render o usa /set_yt."
                 )
             raise ValueError(f"Error al descargar: {err_text}")
 

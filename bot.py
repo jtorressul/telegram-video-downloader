@@ -517,6 +517,29 @@ async def set_ig_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sid = context.args[0].strip().strip('"').strip("'").strip()
+    if sid.lower() in ("clear", "reset", "delete", "borrar", "limpiar"):
+        os.environ.pop("INSTAGRAM_SESSIONID", None)
+        proj_dir = os.path.dirname(os.path.abspath(__file__))
+        c_path = os.path.join(proj_dir, COOKIES_FILE)
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(COOKIES_FILE))
+        for p in [c_path, tmp_path]:
+            if os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [
+                            l for l in f
+                            if not any(d in l.lower() for d in ['instagram.com', 'instagr.am'])
+                        ]
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.writelines(lines)
+                except Exception:
+                    pass
+        from downloader import setup_cookies_file
+        updated_path = setup_cookies_file(COOKIES_FILE)
+        downloader.cookies_file = updated_path
+        await update.message.reply_html("🗑️ <b>Sesión de Instagram eliminada con éxito.</b>")
+        return
+
     if "sessionid=" in sid:
         sid = sid.split("sessionid=")[1].split(";")[0].strip()
 
@@ -533,7 +556,7 @@ async def set_ig_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows admins to set YouTube cookies directly or get instructions to upload cookies.txt."""
+    """Allows admins to set YouTube cookies directly, clear them, or get instructions to upload cookies.txt."""
     user = update.effective_user
     chat = update.effective_chat
     is_authorized = user.id in ADMIN_IDS
@@ -560,16 +583,44 @@ async def set_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_html(
             "🍪 <b>Configuración de Cookies para YouTube</b>\n\n"
-            "Tienes 2 opciones sencillas:\n\n"
+            "Tienes 3 opciones sencillas:\n\n"
             "1️⃣ <b>Enviar el archivo (Recomendado):</b>\n"
             "Adjunta y envía tu archivo <code>cookies.txt</code> como documento a este chat. El bot lo importará automáticamente.\n\n"
             "2️⃣ <b>Por comando:</b>\n"
             "Usa <code>/set_yt [contenido_de_cookies]</code>\n\n"
+            "3️⃣ <b>Limpiar cookies de YouTube:</b>\n"
+            "Usa <code>/set_yt clear</code> para eliminar las cookies de YouTube y descargar de forma directa y limpia.\n\n"
             "<i>(En grupos, tus mensajes con cookies se eliminan automáticamente por seguridad).</i>"
         )
         return
 
     content = " ".join(context.args).strip()
+    if content.lower() in ("clear", "reset", "delete", "eliminar", "borrar"):
+        os.environ.pop("YOUTUBE_COOKIES", None)
+        proj_dir = os.path.dirname(os.path.abspath(__file__))
+        c_path = os.path.join(proj_dir, COOKIES_FILE)
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(COOKIES_FILE))
+        for p in [c_path, tmp_path]:
+            if os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [
+                            l for l in f
+                            if not any(d in l.lower() for d in ['youtube.com', 'google.com'])
+                        ]
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.writelines(lines)
+                except Exception:
+                    pass
+        from downloader import setup_cookies_file
+        updated_path = setup_cookies_file(COOKIES_FILE)
+        downloader.cookies_file = updated_path
+        await update.message.reply_html(
+            "🗑️ <b>Cookies de YouTube eliminadas con éxito.</b>\n\n"
+            "El bot descargará YouTube de forma directa y limpia sin cookies de sesión."
+        )
+        return
+
     os.environ["YOUTUBE_COOKIES"] = content
     from downloader import setup_cookies_file
     updated_path = setup_cookies_file(COOKIES_FILE)
