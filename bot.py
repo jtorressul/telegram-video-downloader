@@ -483,6 +483,55 @@ async def unvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await vip_management_command(update, context, False)
 
 
+async def set_ig_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to set or update Instagram session cookie directly via chat."""
+    user = update.effective_user
+    chat = update.effective_chat
+    is_authorized = user.id in ADMIN_IDS
+
+    if not is_authorized and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]:
+                is_authorized = True
+        except Exception:
+            pass
+
+    if not is_authorized:
+        await update.message.reply_html("❌ Solo los administradores pueden configurar la sesión de Instagram.")
+        return
+
+    # Delete command message if in group to keep cookie secret
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    if not context.args:
+        await update.message.reply_html(
+            "ℹ️ <b>Uso:</b> <code>/set_ig TU_SESSION_ID</code>\n\n"
+            "Ejemplo: <code>/set_ig 11702076966%3AoJDj7KwxfUam8r...</code>\n\n"
+            "<i>(En grupos, el bot borra automáticamente tu mensaje para proteger la clave).</i>"
+        )
+        return
+
+    sid = context.args[0].strip().strip('"').strip("'").strip()
+    if "sessionid=" in sid:
+        sid = sid.split("sessionid=")[1].split(";")[0].strip()
+
+    os.environ["INSTAGRAM_SESSIONID"] = sid
+    from downloader import setup_cookies_file
+    updated_path = setup_cookies_file(COOKIES_FILE)
+    downloader.cookies_file = updated_path
+
+    await update.message.reply_html(
+        "✅ <b>Sesión de Instagram configurada y guardada con éxito.</b>\n\n"
+        f"📁 Archivo: <code>{updated_path}</code>\n"
+        "🔓 Ya puedes descargar cualquier Reel o publicación de Instagram con restricción."
+    )
+
+
 async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greets the group when added and explains features."""
     chat = update.effective_chat
@@ -1147,6 +1196,7 @@ def main():
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("vip", vip_cmd))
     app.add_handler(CommandHandler("unvip", unvip_cmd))
+    app.add_handler(CommandHandler(["set_ig", "setig", "cookie", "cookies"], set_ig_command))
     app.add_handler(CommandHandler(["mp3", "audio", "musica"], mp3_command))
     app.add_handler(CommandHandler(["mp4", "video"], mp4_command))
     app.add_handler(CallbackQueryHandler(callback_handler))

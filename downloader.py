@@ -834,20 +834,45 @@ def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
     or automatically exports relevant cookies from installed local browsers (Firefox, Chrome, etc.).
     Supports COOKIES_CONTENT, YOUTUBE_COOKIES, INSTAGRAM_COOKIES, and INSTAGRAM_SESSIONID.
     """
-    ig_sessionid = os.getenv("INSTAGRAM_SESSIONID") or os.getenv("IG_SESSIONID")
+    ig_sessionid = (
+        os.getenv("INSTAGRAM_SESSIONID")
+        or os.getenv("INSTAGRAM_SESSION_ID")
+        or os.getenv("IG_SESSIONID")
+        or os.getenv("IG_SESSION_ID")
+        or os.getenv("INSTAGRAM_SESSION")
+        or os.getenv("IG_SESSION")
+        or os.getenv("SESSIONID")
+        or os.getenv("sessionid")
+        or os.getenv("instagram_sessionid")
+        or os.getenv("instagram_session_id")
+        or os.getenv("ig_sessionid")
+    )
     env_sources = [
         os.getenv("COOKIES_CONTENT"),
         os.getenv("YOUTUBE_COOKIES"),
         os.getenv("INSTAGRAM_COOKIES"),
     ]
 
+    proj_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        cookies_path if os.path.isabs(cookies_path) else os.path.join(proj_dir, cookies_path),
+        os.path.join(tempfile.gettempdir(), os.path.basename(cookies_path)),
+    ]
+
     existing_lines = []
-    if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-        try:
-            with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
-                existing_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        except Exception:
-            existing_lines = []
+    found_existing = False
+    chosen_path = candidates[0]
+
+    for cand in candidates:
+        if os.path.exists(cand) and os.path.getsize(cand) > 0:
+            try:
+                with open(cand, "r", encoding="utf-8", errors="ignore") as f:
+                    existing_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                found_existing = True
+                chosen_path = cand
+                break
+            except Exception:
+                continue
 
     new_lines = []
     for src in env_sources:
@@ -859,6 +884,8 @@ def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
 
     if ig_sessionid and ig_sessionid.strip():
         sid = ig_sessionid.strip().strip('"').strip("'").strip()
+        if "sessionid=" in sid:
+            sid = sid.split("sessionid=")[1].split(";")[0].strip()
         user_id = sid.split('%3A')[0].split(':')[0]
         if user_id.isdigit():
             new_lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tds_user_id\t{user_id}")
@@ -874,17 +901,18 @@ def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
             else:
                 cookies_dict[l] = l
 
-        try:
-            with open(cookies_path, "w", encoding="utf-8") as f:
-                f.write("# Netscape HTTP Cookie File\n")
-                for c_line in cookies_dict.values():
-                    f.write(c_line + "\n")
-            return cookies_path
-        except Exception as e:
-            logger.warning(f"Error escribiendo archivo de cookies: {e}")
+        for cand in candidates:
+            try:
+                with open(cand, "w", encoding="utf-8") as f:
+                    f.write("# Netscape HTTP Cookie File\n")
+                    for c_line in cookies_dict.values():
+                        f.write(c_line + "\n")
+                return cand
+            except Exception as e:
+                logger.warning(f"Error escribiendo archivo de cookies en {cand}: {e}")
 
-    if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-        return cookies_path
+    if found_existing:
+        return chosen_path
 
     # Try automatic extraction from local browsers
     for browser in ['firefox', 'chrome', 'brave', 'chromium', 'edge']:
@@ -1065,6 +1093,14 @@ class VideoDownloader:
 
         if platform_name == "Instagram":
             url = normalize_instagram_url(url)
+            has_session = False
+            if self.cookies_file and os.path.exists(self.cookies_file):
+                try:
+                    with open(self.cookies_file, 'r', errors='ignore') as cf:
+                        has_session = 'sessionid' in cf.read()
+                except Exception:
+                    pass
+            logger.info(f"📸 Intento de descarga Instagram: cookies_file={self.cookies_file}, sessionid_activo={has_session}")
 
         ydl_opts: Dict[str, Any] = {
             'outtmpl': output_template,
@@ -1080,9 +1116,9 @@ class VideoDownloader:
             'fragment_retries': 5,
         }
 
-        # For non-YouTube platforms, set standard User-Agent.
-        # For YouTube, DO NOT override User-Agent so yt-dlp matches internal client signatures.
-        if not is_yt:
+        # For non-YouTube and non-Instagram platforms, set standard User-Agent.
+        # For YouTube and Instagram, DO NOT override User-Agent so yt-dlp matches internal client and TLS impersonation signatures.
+        if not is_yt and platform_name != "Instagram":
             ydl_opts['http_headers'] = {
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
