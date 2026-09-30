@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copiar el código del bot
 COPY . .
 
-# Puerto para health checks de Render
-EXPOSE 8080
+# Puertos para health checks de Render (8080 y 10000)
+EXPOSE 8080 10000
 
 CMD ["python", "bot.py"]

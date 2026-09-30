@@ -17,6 +17,7 @@ from telegram import (
     InputMediaVideo,
 )
 from telegram.constants import ChatAction, ChatType, ParseMode, ChatMemberStatus
+from telegram.error import Conflict, NetworkError, Forbidden, BadRequest
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -80,22 +81,26 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK - Downloader Bot con Sistema VIP y Arquitectura Zero-Cookies activa.")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def log_message(self, format, *args):
         pass
 
 
 def start_health_server():
     """Starts the health check HTTP server on PORT environment variable if available."""
-    port_str = os.getenv("PORT")
-    if port_str:
-        try:
-            port = int(port_str)
-            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            logger.info(f"✅ Servidor web de salud iniciado en el puerto {port}")
-        except Exception as e:
-            logger.warning(f"No se pudo iniciar el servidor web de salud: {e}")
+    port_str = os.getenv("PORT", "8080")
+    try:
+        port = int(port_str)
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"✅ Servidor web de salud iniciado en 0.0.0.0:{port}")
+    except Exception as e:
+        logger.warning(f"No se pudo iniciar el servidor web de salud: {e}")
 
 
 def format_filesize(size_bytes: int) -> str:
@@ -122,10 +127,14 @@ async def schedule_midnight_quota_reset():
             count = user_db.reset_all_daily_quotas()
             logger.info(f"✅ Reinicio automático de medianoche completado: {count} usuarios reiniciados.")
         except asyncio.CancelledError:
+            logger.info("🛑 Tarea de reinicio de cuotas cancelada limpiamente.")
             break
         except Exception as e:
             logger.error(f"Error en la tarea de reinicio a las 12:00 AM: {e}", exc_info=True)
-            await asyncio.sleep(60)
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
 
 
 async def post_init(application: Application) -> None:
@@ -133,7 +142,19 @@ async def post_init(application: Application) -> None:
     bot_info = await application.bot.get_me()
     application.bot_data['username'] = bot_info.username
     logger.info(f"Bot iniciado exitosamente como @{bot_info.username}")
-    asyncio.create_task(schedule_midnight_quota_reset())
+    task = asyncio.create_task(schedule_midnight_quota_reset())
+    application.bot_data['quota_reset_task'] = task
+
+
+async def post_shutdown(application: Application) -> None:
+    """Cleanly cancel and await background tasks when stopping."""
+    task = application.bot_data.get('quota_reset_task')
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -1093,6 +1114,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manejo global de excepciones para el bot de Telegram."""
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning(
+            "⚠️ [Conflict] Telegram terminó esta sesión de getUpdates porque otra instancia del bot se inició con este token. "
+            "Esto ocurre normalmente durante un nuevo despliegue o reinicio en Render mientras el contenedor anterior se apaga. "
+            "Esta instancia cederá el paso y se detendrá de forma ordenada."
+        )
+        return
+    elif isinstance(err, (NetworkError, asyncio.TimeoutError)):
+        logger.warning(f"⚠️ Error temporal de red con Telegram: {err}")
+        return
+    elif isinstance(err, Forbidden):
+        logger.warning(f"⚠️ Telegram Forbidden: el bot fue bloqueado o carece de permisos: {err}")
+        return
+    elif isinstance(err, BadRequest):
+        logger.warning(f"⚠️ Telegram BadRequest: {err}")
+        return
+
+    logger.error(f"❌ Error no controlado procesando actualización: {err}", exc_info=err)
+
+
 def main():
     """Main entrypoint for the Telegram bot."""
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "TU_TOKEN_AQUI":
@@ -1114,7 +1158,17 @@ def main():
         pool_timeout=60
     )
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).post_init(post_init).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # Global error handler
+    app.add_error_handler(global_error_handler)
 
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
