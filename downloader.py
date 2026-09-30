@@ -37,6 +37,10 @@ TARGET_COMPRESSION_BYTES = 45 * 1024 * 1024
 _custom_cobalt = os.getenv("COBALT_API_URL", "").strip()
 COBALT_INSTANCES = [_custom_cobalt] if _custom_cobalt else []
 
+# Instagram phantom account credentials (optional for full login-gated content access)
+IG_USERNAME = os.getenv("IG_USERNAME", "").strip()
+IG_PASSWORD = os.getenv("IG_PASSWORD", "").strip()
+
 
 def extract_youtube_id(url: str) -> Optional[str]:
     """Extracts 11-character YouTube video ID."""
@@ -1023,17 +1027,19 @@ class VideoDownloader:
             except Exception as e_tw:
                 logger.warning(f"FxTwitter falló ({e_tw}), intentando yt-dlp como fallback...")
 
-        # 4. Instagram (100% Zero-Cookies Polaris GraphQL + Bridge)
+        # 4. Instagram
         if platform_name == "Instagram":
             norm_url = normalize_instagram_url(url)
-            try:
-                return download_instagram_zero_cookies(norm_url, temp_subfolder, format_type=format_type)
-            except Exception as e_ig:
-                logger.warning(f"Instagram Zero-Cookies no pudo extraer el medio: {e_ig}")
-                raise ValueError(
-                    "🔒 Este contenido de Instagram es privado, restringido por edad o requiere inicio de sesión en su plataforma.\n"
-                    "El bot opera con arquitectura Zero-Cookies y solo puede descargar contenido accesible públicamente."
-                )
+            # Si no hay cuenta fantasma configurada, usar directamente el extractor Zero-Cookies
+            if not (IG_USERNAME and IG_PASSWORD):
+                try:
+                    return download_instagram_zero_cookies(norm_url, temp_subfolder, format_type=format_type)
+                except Exception as e_ig:
+                    logger.warning(f"Instagram Zero-Cookies no pudo extraer el medio: {e_ig}")
+                    raise ValueError(
+                        "🔒 Este contenido de Instagram es privado, restringido por edad o requiere inicio de sesión en su plataforma.\n"
+                        "El bot opera con arquitectura Zero-Cookies y solo puede descargar contenido accesible públicamente."
+                    )
 
         # 5. YouTube (Bridge attempt first on cloud datacenter IPs)
         if platform_name in ("YouTube", "YouTube Music"):
@@ -1077,6 +1083,7 @@ class VideoDownloader:
             ydl_opts['merge_output_format'] = 'mp4'
 
         is_yt = is_youtube_url(url)
+        is_ig = (platform_name == "Instagram")
         attempts = []
         if is_yt:
             if self.cookies_file and os.path.exists(self.cookies_file):
@@ -1085,6 +1092,12 @@ class VideoDownloader:
             attempts.append(("android_vr", ['android_vr'], False))
             attempts.append(("tv", ['tv'], False))
             attempts.append(("web", ['web'], False))
+        elif is_ig and IG_USERNAME and IG_PASSWORD:
+            session_file = os.path.join(tempfile.gettempdir(), "ig_bot_session.txt")
+            ydl_opts['username'] = IG_USERNAME
+            ydl_opts['password'] = IG_PASSWORD
+            ydl_opts['cookiefile'] = session_file
+            attempts.append(("ig_phantom_account", None, True))
         else:
             attempts.append(("default", None, bool(self.cookies_file)))
 
