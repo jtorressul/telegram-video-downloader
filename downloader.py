@@ -40,6 +40,7 @@ COBALT_INSTANCES = [_custom_cobalt] if _custom_cobalt else []
 # Instagram phantom account credentials (optional for full login-gated content access)
 IG_USERNAME = os.getenv("IG_USERNAME", "").strip()
 IG_PASSWORD = os.getenv("IG_PASSWORD", "").strip()
+INSTAGRAM_SESSIONID = os.getenv("INSTAGRAM_SESSIONID", "").strip()
 
 
 def extract_youtube_id(url: str) -> Optional[str]:
@@ -846,6 +847,178 @@ def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: 
 
 
 # ==============================================================================
+# 3.1. INSTAGRAM AUTHENTICATED EXTRACTOR (instagrapi Client)
+# ==============================================================================
+_instagrapi_client = None
+
+def get_instagrapi_client():
+    """Initializes or retrieves singleton instagrapi client with session persistence."""
+    global _instagrapi_client
+    if _instagrapi_client is not None:
+        return _instagrapi_client
+
+    try:
+        from instagrapi import Client
+    except ImportError:
+        logger.warning("instagrapi no está disponible en este entorno.")
+        return None
+
+    cl = Client()
+    session_file = os.path.join(tempfile.gettempdir(), "instagrapi_session.json")
+
+    # 1. Intentar cargar sesión en caché
+    if os.path.exists(session_file):
+        try:
+            cl.load_settings(session_file)
+            logger.info("✅ Sesión de Instagram cargada desde caché local.")
+            _instagrapi_client = cl
+            return cl
+        except Exception as e:
+            logger.warning(f"Error cargando sesión previa de Instagram: {e}")
+
+    # 2. Login con SESSIONID
+    if INSTAGRAM_SESSIONID:
+        try:
+            cl.login_by_sessionid(INSTAGRAM_SESSIONID)
+            cl.dump_settings(session_file)
+            logger.info("✅ Sesión de Instagram iniciada exitosamente vía INSTAGRAM_SESSIONID.")
+            _instagrapi_client = cl
+            return cl
+        except Exception as e:
+            logger.error(f"Fallo login con INSTAGRAM_SESSIONID: {e}")
+
+    # 3. Login con Usuario y Contraseña
+    if IG_USERNAME and IG_PASSWORD:
+        try:
+            cl.login(IG_USERNAME, IG_PASSWORD)
+            cl.dump_settings(session_file)
+            logger.info(f"✅ Sesión de Instagram iniciada exitosamente con cuenta @{IG_USERNAME}.")
+            _instagrapi_client = cl
+            return cl
+        except Exception as e:
+            logger.error(f"Fallo login con usuario y contraseña de Instagram: {e}")
+
+    return None
+
+
+def download_instagram_authenticated(url: str, temp_subfolder: str, format_type: str = "mp4") -> Dict[str, Any]:
+    """Downloads any Instagram Reel, Video, Photo or Album using instagrapi."""
+    cl = get_instagrapi_client()
+    if not cl:
+        raise ValueError("No se pudo iniciar sesión con la cuenta de servicio de Instagram.")
+
+    media_pk = cl.media_pk_from_url(url)
+    info = cl.media_info(media_pk)
+
+    title = info.caption_text or "Reel de Instagram"
+    author = (info.user.username if info.user else None) or "Instagram"
+    duration = info.video_duration or None
+
+    if format_type == 'mp3':
+        raw_vid = cl.video_download(media_pk, temp_subfolder)
+        mp3_file = os.path.join(temp_subfolder, f"ig_{media_pk}.mp3")
+        cmd = ['ffmpeg', '-y', '-i', str(raw_vid), '-vn', '-acodec', 'libmp3lame', '-q:a', '2', mp3_file]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        final_file = mp3_file if (os.path.exists(mp3_file) and os.path.getsize(mp3_file) > 0) else str(raw_vid)
+        thumb_path = None
+        if info.thumbnail_url:
+            raw_thumb = os.path.join(temp_subfolder, "ig_thumb.jpg")
+            try:
+                urllib.request.urlretrieve(str(info.thumbnail_url), raw_thumb)
+                thumb_path = convert_thumbnail_to_jpg(raw_thumb, final_file, temp_subfolder)
+                apply_id3_tags(final_file, title, author, thumb_path)
+            except Exception:
+                pass
+        return {
+            'type': 'audio',
+            'file_path': final_file,
+            'thumbnail_path': thumb_path,
+            'title': title,
+            'artist': author,
+            'duration': int(duration) if duration else None,
+            'width': None,
+            'height': None,
+            'filesize': os.path.getsize(final_file),
+            'platform': 'Instagram',
+            'platform_emoji': '📸',
+            'is_audio': True,
+            'format': 'mp3',
+        }
+
+    # Carousel / Album (media_type == 8)
+    if info.media_type == 8:
+        album_paths = cl.album_download(media_pk, temp_subfolder)
+        media_items = []
+        for p in album_paths:
+            p_str = str(p)
+            is_vid = p_str.lower().endswith(('.mp4', '.mov'))
+            media_items.append({
+                'type': 'video' if is_vid else 'photo',
+                'file_path': p_str,
+                'thumbnail_path': None,
+                'filesize': os.path.getsize(p_str),
+            })
+        return {
+            'type': 'carousel',
+            'media_items': media_items,
+            'title': title,
+            'artist': author,
+            'duration': None,
+            'filesize': sum(i['filesize'] for i in media_items),
+            'platform': 'Instagram',
+            'platform_emoji': '📸',
+            'is_audio': False,
+            'format': 'mp4',
+        }
+
+    # Photo (media_type == 1)
+    if info.media_type == 1:
+        photo_path = cl.photo_download(media_pk, temp_subfolder)
+        return {
+            'type': 'photo',
+            'file_path': str(photo_path),
+            'thumbnail_path': None,
+            'title': title,
+            'artist': author,
+            'duration': None,
+            'width': None,
+            'height': None,
+            'filesize': os.path.getsize(str(photo_path)),
+            'platform': 'Instagram',
+            'platform_emoji': '📸',
+            'is_audio': False,
+            'format': 'mp4',
+        }
+
+    # Video / Reel
+    vid_path = cl.video_download(media_pk, temp_subfolder)
+    thumb_path = None
+    if info.thumbnail_url:
+        raw_thumb = os.path.join(temp_subfolder, "ig_thumb.jpg")
+        try:
+            urllib.request.urlretrieve(str(info.thumbnail_url), raw_thumb)
+            thumb_path = convert_thumbnail_to_jpg(raw_thumb, str(vid_path), temp_subfolder)
+        except Exception:
+            pass
+
+    return {
+        'type': 'video',
+        'file_path': str(vid_path),
+        'thumbnail_path': thumb_path,
+        'title': title,
+        'artist': author,
+        'duration': int(duration) if duration else None,
+        'width': None,
+        'height': None,
+        'filesize': os.path.getsize(str(vid_path)),
+        'platform': 'Instagram',
+        'platform_emoji': '📸',
+        'is_audio': False,
+        'format': 'mp4',
+    }
+
+
+# ==============================================================================
 # 4. YOUTUBE ZERO-COOKIES & BRIDGE EXTRACTOR
 # ==============================================================================
 def download_youtube_bridge(url: str, format_type: str, temp_subfolder: str) -> Optional[Dict[str, Any]]:
@@ -1030,16 +1203,23 @@ class VideoDownloader:
         # 4. Instagram
         if platform_name == "Instagram":
             norm_url = normalize_instagram_url(url)
-            # Si no hay cuenta fantasma configurada, usar directamente el extractor Zero-Cookies
-            if not (IG_USERNAME and IG_PASSWORD):
+            # 1. Si hay credenciales de cuenta secundaria/fantasma, usar instagrapi
+            if INSTAGRAM_SESSIONID or (IG_USERNAME and IG_PASSWORD):
                 try:
-                    return download_instagram_zero_cookies(norm_url, temp_subfolder, format_type=format_type)
-                except Exception as e_ig:
-                    logger.warning(f"Instagram Zero-Cookies no pudo extraer el medio: {e_ig}")
-                    raise ValueError(
-                        "🔒 Este contenido de Instagram es privado, restringido por edad o requiere inicio de sesión en su plataforma.\n"
-                        "El bot opera con arquitectura Zero-Cookies y solo puede descargar contenido accesible públicamente."
-                    )
+                    logger.info("🔑 Descargando Instagram mediante cuenta de servicio (instagrapi)...")
+                    return download_instagram_authenticated(norm_url, temp_subfolder, format_type=format_type)
+                except Exception as e_auth:
+                    logger.warning(f"Error en cuenta de servicio IG ({e_auth}), probando Polaris Zero-Cookies...")
+
+            # 2. De lo contrario o como fallback, usar Polaris Zero-Cookies
+            try:
+                return download_instagram_zero_cookies(norm_url, temp_subfolder, format_type=format_type)
+            except Exception as e_ig:
+                logger.warning(f"Instagram Zero-Cookies no pudo extraer el medio: {e_ig}")
+                raise ValueError(
+                    "🔒 Este contenido de Instagram es privado, restringido por edad o requiere inicio de sesión en su plataforma.\n"
+                    "El bot opera con arquitectura Zero-Cookies y solo puede descargar contenido accesible públicamente."
+                )
 
         # 5. YouTube (Bridge attempt first on cloud datacenter IPs)
         if platform_name in ("YouTube", "YouTube Music"):
@@ -1083,7 +1263,6 @@ class VideoDownloader:
             ydl_opts['merge_output_format'] = 'mp4'
 
         is_yt = is_youtube_url(url)
-        is_ig = (platform_name == "Instagram")
         attempts = []
         if is_yt:
             if self.cookies_file and os.path.exists(self.cookies_file):
@@ -1092,12 +1271,6 @@ class VideoDownloader:
             attempts.append(("android_vr", ['android_vr'], False))
             attempts.append(("tv", ['tv'], False))
             attempts.append(("web", ['web'], False))
-        elif is_ig and IG_USERNAME and IG_PASSWORD:
-            session_file = os.path.join(tempfile.gettempdir(), "ig_bot_session.txt")
-            ydl_opts['username'] = IG_USERNAME
-            ydl_opts['password'] = IG_PASSWORD
-            ydl_opts['cookiefile'] = session_file
-            attempts.append(("ig_phantom_account", None, True))
         else:
             attempts.append(("default", None, bool(self.cookies_file)))
 
