@@ -1242,6 +1242,11 @@ class VideoDownloader:
             'fragment_retries': 5,
         }
 
+        # Soporte de Proxy para yt-dlp (evita bloqueos de IP en centros de datos como Render)
+        proxy = os.getenv("YTDL_PROXY") or os.getenv("HTTP_PROXY")
+        if proxy:
+            ydl_opts['proxy'] = proxy.strip()
+
         if self.cookies_file and os.path.exists(self.cookies_file):
             ydl_opts['cookiefile'] = self.cookies_file
 
@@ -1267,6 +1272,9 @@ class VideoDownloader:
         if is_yt:
             if self.cookies_file and os.path.exists(self.cookies_file):
                 attempts.append(("con cookies", None, True))
+            attempts.append(("ios", ['ios'], False))
+            attempts.append(("android", ['android'], False))
+            attempts.append(("mweb", ['mweb'], False))
             attempts.append(("visionos", ['visionos'], False))
             attempts.append(("android_vr", ['android_vr'], False))
             attempts.append(("tv", ['tv'], False))
@@ -1284,7 +1292,7 @@ class VideoDownloader:
                 attempt_opts.pop('cookiefile', None)
             if client:
                 attempt_opts['extractor_args'] = {'youtube': {'player_client': client}}
-                if any(c in ('android', 'ios', 'visionos', 'android_vr', 'tv') for c in client):
+                if any(c in ('android', 'ios', 'visionos', 'android_vr', 'tv', 'mweb') for c in client):
                     attempt_opts.pop('cookiefile', None)
 
             try:

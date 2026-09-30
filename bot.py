@@ -60,10 +60,21 @@ logger = logging.getLogger(__name__)
 # Constants
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip()
+raw_cookies = os.getenv("YOUTUBE_COOKIES") or os.getenv("COOKIES_CONTENT")
+if raw_cookies and (not os.path.exists(COOKIES_FILE) or os.path.getsize(COOKIES_FILE) == 0):
+    env_cookies_path = os.path.join(tempfile.gettempdir(), "server_cookies.txt")
+    try:
+        with open(env_cookies_path, "w", encoding="utf-8") as f:
+            f.write(raw_cookies.strip() + "\n")
+        COOKIES_FILE = env_cookies_path
+        logger.info("✅ Cookies cargadas exitosamente desde variable de entorno.")
+    except Exception as e_cook:
+        logger.warning(f"Error escribiendo cookies desde variable de entorno: {e_cook}")
+
 ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip().isdigit()]
 
 # Initialize services
-downloader = VideoDownloader(cookies_file=COOKIES_FILE if os.path.exists(COOKIES_FILE) else None)
+downloader = VideoDownloader(cookies_file=COOKIES_FILE if (os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0) else None)
 cache = VideoCache()
 user_db = UserDatabase()
 

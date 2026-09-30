@@ -19,3 +19,11 @@ services:
         sync: false
       - key: IG_PASSWORD
         sync: false
+      - key: INSTAGRAM_SESSIONID
+        sync: false
+      - key: COBALT_API_URL
+        sync: false
+      - key: YOUTUBE_COOKIES
+        sync: false
+      - key: YTDL_PROXY
+        sync: false
