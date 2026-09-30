@@ -407,8 +407,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Copia el enlace del video o audio que deseas.\n"
         "2️⃣ Envíalo al chat privado o en el grupo.\n\n"
         "📋 <b>Reglas de Acceso (Privado y Grupos):</b>\n"
-        f"• <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día en <b>X, Instagram y TikTok</b>.\n"
-        f"• <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día en <b>todas las plataformas</b> (YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
+        f"• <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día en <b>X, Instagram, TikTok y Facebook</b>.\n"
+        f"• <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día en <b>todas las plataformas</b> (YouTube MP3/MP4, Spotify, etc.).\n\n"
         "💡 <b>Comandos disponibles:</b>\n"
         "• <code>/stats</code> - Muestra tus estadísticas y cuota diaria.\n"
         "• <code>/mp3 [enlace]</code> - Descarga directa en audio MP3.\n"
@@ -609,7 +609,8 @@ async def execute_download(
                 "Plataformas permitidas para tu rango:\n"
                 "• 🐦 <b>X (Twitter)</b>\n"
                 "• 📸 <b>Instagram</b>\n"
-                "• 🎵 <b>TikTok</b>\n\n"
+                "• 🎵 <b>TikTok</b>\n"
+                "• 👥 <b>Facebook</b>\n\n"
                 f"Para descargar de <b>{platform}</b>, solicita tu rango VIP a un administrador del grupo."
             )
             await context.bot.send_message(chat_id=chat_id, text=deny_text, parse_mode=ParseMode.HTML)
@@ -1027,8 +1028,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 ¡Hola, <b>{name}</b>!\n\n"
             "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b> y arquitectura <b>Zero-Cookies</b>.\n\n"
             "✨ <b>Niveles de Membresía:</b>\n"
-            f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día (Instagram, TikTok, X).\n"
-            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día (YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
+            f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día (Instagram, TikTok, X, Facebook).\n"
+            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día (YouTube MP3/MP4, Spotify, etc.).\n\n"
             "📥 Envíame cualquier enlace para comenzar."
         )
         await query.answer()

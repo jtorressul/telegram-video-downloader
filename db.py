@@ -11,7 +11,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "bot_users.db")
 NO_VIP_DAILY_LIMIT = 5
 VIP_DAILY_LIMIT = 15
 
-SOCIAL_PLATFORMS = {"Instagram", "TikTok", "X (Twitter)"}
+SOCIAL_PLATFORMS = {"Instagram", "TikTok", "X (Twitter)", "Facebook"}
 
 
 def get_local_now() -> datetime:

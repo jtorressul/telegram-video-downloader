@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html
 import glob
 import shutil
 import tempfile
@@ -121,15 +122,18 @@ def detect_platform(url: str) -> Tuple[str, str]:
 
 def normalize_instagram_url(url: str) -> str:
     """Extracts clean canonical Instagram post or reel URL."""
-    m = re.search(r'(?:instagram\.com|instagr\.am|ig\.me)/(?:p|reel|reels|tv)/([a-zA-Z0-9_-]+)', url)
+    m = re.search(r'(?:instagram\.com|instagr\.am|ig\.me)/(p|reel|reels|tv|share/reel|share/p)/([a-zA-Z0-9_-]+)', url)
     if m:
-        return f"https://www.instagram.com/reel/{m.group(1)}/"
+        ptype = m.group(1).lower()
+        if 'p' in ptype:
+            return f"https://www.instagram.com/p/{m.group(2)}/"
+        return f"https://www.instagram.com/reel/{m.group(2)}/"
     return url
 
 
 def extract_instagram_shortcode(url: str) -> Optional[str]:
     """Extracts shortcode from Instagram URL."""
-    m = re.search(r'(?:instagram\.com|instagr\.am|ig\.me)/(?:p|reel|reels|tv|share/reel)/([a-zA-Z0-9_-]+)', url)
+    m = re.search(r'(?:instagram\.com|instagr\.am|ig\.me)/(?:p|reel|reels|tv|share/reel|share/p)/([a-zA-Z0-9_-]+)', url)
     return m.group(1) if m else None
 
 
@@ -401,17 +405,20 @@ def download_tiktok_fast(url: str, format_type: str, temp_subfolder: str) -> Dic
 # 2. X.COM (TWITTER) FAST EXTRACTOR (100% Zero-Cookies via FxTwitter)
 # ==============================================================================
 def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4") -> Dict[str, Any]:
-    """Downloads Twitter/X media using FxTwitter API directly (bypasses 18+/NSFW auth and cloud IP blocks)."""
-    m = re.search(r'(?:twitter\.com|x\.com)/([a-zA-Z0-9_]+)/status/(\d+)', url)
+    """Downloads Twitter/X media using FxTwitter or VxTwitter API directly (bypasses 18+/NSFW auth and cloud IP blocks)."""
+    m = re.search(r'(?:twitter\.com|x\.com)/(?:([a-zA-Z0-9_]+)/status/|i/status/)(\d+)', url)
     if not m:
         raise ValueError("URL de X (Twitter) no válida.")
-    user, twid = m.group(1), m.group(2)
+    user = m.group(1) or "i"
+    twid = m.group(2)
 
     data = None
     last_err = None
     endpoints = [
-        f"https://api.fxtwitter.com/2/status/{twid}",
+        f"https://api.fxtwitter.com/status/{twid}",
         f"https://api.fxtwitter.com/{user}/status/{twid}",
+        f"https://api.vxtwitter.com/status/{twid}",
+        f"https://api.vxtwitter.com/Twitter/status/{twid}",
     ]
     for api_url in endpoints:
         try:
@@ -419,9 +426,10 @@ def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4
                 api_url,
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                if data and (data.get('status') or data.get('tweet')):
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw_json = json.loads(resp.read().decode('utf-8'))
+                if raw_json and (raw_json.get('status') or raw_json.get('tweet') or raw_json.get('media_extended') or raw_json.get('mediaURLs')):
+                    data = raw_json
                     break
         except Exception as e:
             last_err = e
@@ -429,16 +437,45 @@ def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4
     if not data:
         raise ValueError(f"No se pudo consultar la API de X (Twitter): {last_err or 'Error de conexión'}")
 
-    status_obj = data.get('status') or data.get('tweet') or {}
-    text = status_obj.get('text') or "Tweet de X"
-    author_obj = status_obj.get('author') or {}
-    author = author_obj.get('name') or author_obj.get('screen_name') or user
-    media = status_obj.get('media') or {}
-    media_all = media.get('all') or []
-    if not media_all:
-        videos = media.get('videos') or []
-        photos = media.get('photos') or []
-        media_all = videos + photos
+    # Helper function to download CDN media with browser headers
+    def _download_media_file(cdn_url: str, out_dest: str):
+        cdn_req = urllib.request.Request(
+            cdn_url,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        )
+        with urllib.request.urlopen(cdn_req, timeout=25) as cdn_resp, open(out_dest, 'wb') as out_f:
+            out_f.write(cdn_resp.read())
+
+    # Format 1: FxTwitter
+    if 'tweet' in data or 'status' in data:
+        status_obj = data.get('status') or data.get('tweet') or {}
+        text = status_obj.get('text') or "Tweet de X"
+        author_obj = status_obj.get('author') or {}
+        author = author_obj.get('name') or author_obj.get('screen_name') or user
+        media = status_obj.get('media') or {}
+        media_all = media.get('all') or []
+        if not media_all:
+            videos = media.get('videos') or []
+            photos = media.get('photos') or []
+            media_all = videos + photos
+    # Format 2: VxTwitter
+    else:
+        text = data.get('text') or "Tweet de X"
+        author = data.get('user_name') or data.get('user_screen_name') or user
+        media_all = []
+        for item in data.get('media_extended', []):
+            itype = 'video' if item.get('type') in ['video', 'gif'] else 'photo'
+            media_all.append({
+                'type': itype,
+                'url': item.get('url'),
+                'thumbnail_url': item.get('thumbnail_url'),
+                'duration': item.get('duration_millis', 0) / 1000.0 if item.get('duration_millis') else None,
+                'width': (item.get('size') or {}).get('width'),
+                'height': (item.get('size') or {}).get('height'),
+            })
+        if not media_all and data.get('mediaURLs'):
+            for u in data['mediaURLs']:
+                media_all.append({'type': 'photo', 'url': u})
 
     if not media_all:
         raise ValueError("Este Tweet no contiene videos ni imágenes descargables.")
@@ -454,7 +491,7 @@ def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4
             raise ValueError("No se pudo obtener el enlace del video.")
 
         raw_vid = os.path.join(temp_subfolder, f"tw_{twid}_raw.mp4")
-        urllib.request.urlretrieve(vid_url, raw_vid)
+        _download_media_file(vid_url, raw_vid)
         mp3_file = os.path.join(temp_subfolder, f"tw_{twid}.mp3")
         cmd = ['ffmpeg', '-y', '-i', raw_vid, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', mp3_file]
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
@@ -464,7 +501,7 @@ def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4
         if vid_item.get('thumbnail_url'):
             raw_thumb = os.path.join(temp_subfolder, f"tw_thumb_{twid}.jpg")
             try:
-                urllib.request.urlretrieve(vid_item['thumbnail_url'], raw_thumb)
+                _download_media_file(vid_item['thumbnail_url'], raw_thumb)
                 thumb_path = convert_thumbnail_to_jpg(raw_thumb, final_file, temp_subfolder)
                 apply_id3_tags(final_file, text, author, thumb_path)
             except Exception:
@@ -495,12 +532,12 @@ def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4
             continue
         if itype == 'video':
             out_path = os.path.join(temp_subfolder, f"tw_{twid}_{idx}.mp4")
-            urllib.request.urlretrieve(iurl, out_path)
+            _download_media_file(iurl, out_path)
             t_path = None
             if item.get('thumbnail_url'):
                 raw_thumb = os.path.join(temp_subfolder, f"tw_thumb_{twid}_{idx}.jpg")
                 try:
-                    urllib.request.urlretrieve(item['thumbnail_url'], raw_thumb)
+                    _download_media_file(item['thumbnail_url'], raw_thumb)
                     t_path = convert_thumbnail_to_jpg(raw_thumb, out_path, temp_subfolder)
                 except Exception:
                     pass
@@ -513,9 +550,9 @@ def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4
                 'height': item.get('height'),
                 'filesize': os.path.getsize(out_path),
             })
-        elif itype == 'photo':
+        elif itype in ['photo', 'image']:
             out_path = os.path.join(temp_subfolder, f"tw_{twid}_{idx}.jpg")
-            urllib.request.urlretrieve(iurl, out_path)
+            _download_media_file(iurl, out_path)
             downloaded_items.append({
                 'type': 'photo',
                 'file_path': out_path,
@@ -536,7 +573,7 @@ def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4
         single['platform'] = 'X (Twitter)'
         single['platform_emoji'] = '🐦'
         single['is_audio'] = False
-        single['format'] = 'mp4'
+        single['format'] = 'jpg' if single.get('type') == 'photo' else 'mp4'
         return single
 
     return {
@@ -632,7 +669,7 @@ def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: 
             try:
                 c_req = urllib.request.Request(
                     instance,
-                    data=json.dumps({"url": f"https://www.instagram.com/reel/{shortcode}/"}).encode(),
+                    data=json.dumps({"url": url}).encode(),
                     headers={
                         'Accept': 'application/json',
                         'Content-Type': 'application/json',
@@ -650,7 +687,7 @@ def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: 
                             'type': 'video',
                             'file_path': out_vid,
                             'thumbnail_path': thumb_file,
-                            'title': "Reel de Instagram",
+                            'title': "Publicación de Instagram",
                             'artist': "Instagram",
                             'duration': None,
                             'width': None,
@@ -663,6 +700,48 @@ def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: 
                         }
             except Exception:
                 continue
+
+    # Layer 3: Web OpenGraph Scraper (extracts public Instagram photos)
+    if not media_data and HAS_CURL_CFFI:
+        try:
+            s_ig = cffi_requests.Session(impersonate="chrome124")
+            resp_og = s_ig.get(url, timeout=12, allow_redirects=True)
+            if resp_og.status_code == 200:
+                html_txt = resp_og.text
+                img_m = re.search(r'[\"\']og:image[\"\']\s*content=[\"\']([^\'\"]+)[\"\']', html_txt)
+                if not img_m:
+                    img_m = re.search(r'content=[\"\']([^\'\"]+)[\"\']\s*property=[\"\']og:image[\"\']', html_txt)
+
+                title_m = re.search(r'[\"\']og:title[\"\']\s*content=[\"\']([^\'\"]+)[\"\']', html_txt)
+                if not title_m:
+                    title_m = re.search(r'content=[\"\']([^\'\"]+)[\"\']\s*property=[\"\']og:title[\"\']', html_txt)
+                ig_title = html.unescape(title_m.group(1)) if title_m else "Foto de Instagram"
+
+                if img_m:
+                    direct_img = html.unescape(img_m.group(1))
+                    out_p = os.path.join(temp_subfolder, f"ig_{shortcode}.jpg")
+                    r_dl = s_ig.get(direct_img, timeout=15)
+                    with open(out_p, 'wb') as f:
+                        f.write(r_dl.content)
+                    if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
+                        logger.info("✅ Foto de Instagram extraída vía OpenGraph (Zero-Cookies).")
+                        return {
+                            'type': 'photo',
+                            'file_path': out_p,
+                            'thumbnail_path': None,
+                            'title': ig_title,
+                            'artist': "Instagram",
+                            'duration': None,
+                            'width': None,
+                            'height': None,
+                            'filesize': os.path.getsize(out_p),
+                            'platform': 'Instagram',
+                            'platform_emoji': '📸',
+                            'is_audio': False,
+                            'format': 'jpg',
+                        }
+        except Exception as e_og:
+            logger.debug(f"Instagram OpenGraph scraper falló: {e_og}")
 
     if not media_data:
         raise ValueError(
@@ -746,7 +825,7 @@ def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: 
             'platform': 'Instagram',
             'platform_emoji': '📸',
             'is_audio': False,
-            'format': 'mp4',
+            'format': 'jpg',
         }
 
     # Single Video / Reel
@@ -915,6 +994,8 @@ def download_instagram_authenticated(url: str, temp_subfolder: str, format_type:
     duration = info.video_duration or None
 
     if format_type == 'mp3':
+        if info.media_type not in (2, 8):
+            raise ValueError("Esta publicación de Instagram es una imagen y no contiene video ni audio.")
         raw_vid = cl.video_download(media_pk, temp_subfolder)
         mp3_file = os.path.join(temp_subfolder, f"ig_{media_pk}.mp3")
         cmd = ['ffmpeg', '-y', '-i', str(raw_vid), '-vn', '-acodec', 'libmp3lame', '-q:a', '2', mp3_file]
@@ -924,7 +1005,9 @@ def download_instagram_authenticated(url: str, temp_subfolder: str, format_type:
         if info.thumbnail_url:
             raw_thumb = os.path.join(temp_subfolder, "ig_thumb.jpg")
             try:
-                urllib.request.urlretrieve(str(info.thumbnail_url), raw_thumb)
+                t_req = urllib.request.Request(str(info.thumbnail_url), headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(t_req, timeout=12) as t_resp, open(raw_thumb, 'wb') as t_f:
+                    t_f.write(t_resp.read())
                 thumb_path = convert_thumbnail_to_jpg(raw_thumb, final_file, temp_subfolder)
                 apply_id3_tags(final_file, title, author, thumb_path)
             except Exception:
@@ -987,7 +1070,7 @@ def download_instagram_authenticated(url: str, temp_subfolder: str, format_type:
             'platform': 'Instagram',
             'platform_emoji': '📸',
             'is_audio': False,
-            'format': 'mp4',
+            'format': 'jpg',
         }
 
     # Video / Reel
@@ -996,7 +1079,9 @@ def download_instagram_authenticated(url: str, temp_subfolder: str, format_type:
     if info.thumbnail_url:
         raw_thumb = os.path.join(temp_subfolder, "ig_thumb.jpg")
         try:
-            urllib.request.urlretrieve(str(info.thumbnail_url), raw_thumb)
+            t_req = urllib.request.Request(str(info.thumbnail_url), headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(t_req, timeout=12) as t_resp, open(raw_thumb, 'wb') as t_f:
+                t_f.write(t_resp.read())
             thumb_path = convert_thumbnail_to_jpg(raw_thumb, str(vid_path), temp_subfolder)
         except Exception:
             pass
@@ -1074,6 +1159,143 @@ def download_youtube_bridge(url: str, format_type: str, temp_subfolder: str) -> 
             continue
 
     return None
+
+
+# ==============================================================================
+# 5. FACEBOOK ZERO-COOKIES EXTRACTOR (yt-dlp for Videos + curl_cffi for Photos)
+# ==============================================================================
+def download_facebook_fast(url: str, temp_subfolder: str, format_type: str = "mp4") -> Dict[str, Any]:
+    """
+    Downloads Facebook media (Reels, Videos, Photos and Posts).
+    1. If the URL is a video/reel or format is mp3, tries yt-dlp first.
+    2. If yt-dlp fails or URL is a photo, scrapes OpenGraph media via curl_cffi.
+    """
+    is_video_hint = any(k in url.lower() for k in ['/reel/', '/watch', 'fb.watch', '/videos/'])
+
+    # 1. Try yt-dlp for videos
+    if is_video_hint or format_type == 'mp3':
+        try:
+            ydl_opts = {
+                'outtmpl': os.path.join(temp_subfolder, 'fb_%(id)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'max_filesize': 120 * 1024 * 1024,
+                'socket_timeout': 15,
+            }
+            if format_type == 'mp3':
+                ydl_opts['format'] = 'bestaudio/best'
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+            else:
+                ydl_opts['format'] = 'best[ext=mp4]/best'
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    filename = ydl.prepare_filename(info)
+                    if format_type == 'mp3':
+                        cand = os.path.splitext(filename)[0] + '.mp3'
+                        final_file = cand if os.path.exists(cand) else filename
+                    else:
+                        cand = os.path.splitext(filename)[0] + '.mp4'
+                        final_file = cand if os.path.exists(cand) else filename
+
+                    if os.path.exists(final_file) and os.path.getsize(final_file) > 0:
+                        thumb = convert_thumbnail_to_jpg(None, final_file, temp_subfolder)
+                        return {
+                            'type': 'audio' if format_type == 'mp3' else 'video',
+                            'file_path': final_file,
+                            'thumbnail_path': thumb,
+                            'title': info.get('title') or "Video de Facebook",
+                            'artist': info.get('uploader') or "Facebook",
+                            'duration': int(info.get('duration') or 0) or None,
+                            'width': info.get('width'),
+                            'height': info.get('height'),
+                            'filesize': os.path.getsize(final_file),
+                            'platform': 'Facebook',
+                            'platform_emoji': '👥',
+                            'is_audio': (format_type == 'mp3'),
+                            'format': format_type,
+                        }
+        except Exception as e_fb_vid:
+            logger.info(f"yt-dlp no extrajo video de Facebook ({e_fb_vid}), intentando extractor de fotos...")
+
+    # 2. Extract Photo / Post using curl_cffi TLS impersonation
+    try:
+        session = cffi_requests.Session(impersonate="chrome124") if HAS_CURL_CFFI else None
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        }
+        if session:
+            resp = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+            text = resp.text
+        else:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                text = r.read().decode('utf-8', errors='ignore')
+
+        # Check og:image
+        img_m = re.search(r'[\"\']og:image[\"\']\s*content=[\"\']([^\'\"]+)[\"\']', text)
+        if not img_m:
+            img_m = re.search(r'content=[\"\']([^\'\"]+)[\"\']\s*property=[\"\']og:image[\"\']', text)
+        if not img_m:
+            img_m = re.search(r'[\"\']twitter:image[\"\']\s*content=[\"\']([^\'\"]+)[\"\']', text)
+
+        # Check title
+        title_m = re.search(r'[\"\']og:title[\"\']\s*content=[\"\']([^\'\"]+)[\"\']', text)
+        if not title_m:
+            title_m = re.search(r'content=[\"\']([^\'\"]+)[\"\']\s*property=[\"\']og:title[\"\']', text)
+        title = html.unescape(title_m.group(1)) if title_m else "Foto de Facebook"
+
+        # Check description
+        desc_m = re.search(r'[\"\']og:description[\"\']\s*content=[\"\']([^\'\"]+)[\"\']', text)
+        if not desc_m:
+            desc_m = re.search(r'content=[\"\']([^\'\"]+)[\"\']\s*property=[\"\']og:description[\"\']', text)
+        desc = html.unescape(desc_m.group(1)) if desc_m else ""
+        if desc and len(desc) > len(title) and title == "Foto de Facebook":
+            title = desc[:200]
+
+        if img_m:
+            img_url = html.unescape(img_m.group(1))
+            out_photo = os.path.join(temp_subfolder, "fb_photo.jpg")
+            if session:
+                r_img = session.get(img_url, timeout=20)
+                with open(out_photo, 'wb') as f:
+                    f.write(r_img.content)
+            else:
+                cdn_req = urllib.request.Request(img_url, headers=headers)
+                with urllib.request.urlopen(cdn_req, timeout=20) as cdn_r, open(out_photo, 'wb') as f:
+                    f.write(cdn_r.read())
+
+            if os.path.exists(out_photo) and os.path.getsize(out_photo) > 0:
+                logger.info(f"✅ Foto de Facebook descargada exitosamente ({os.path.getsize(out_photo)} bytes)")
+                return {
+                    'type': 'photo',
+                    'file_path': out_photo,
+                    'thumbnail_path': None,
+                    'title': title,
+                    'artist': "Facebook",
+                    'duration': None,
+                    'width': None,
+                    'height': None,
+                    'filesize': os.path.getsize(out_photo),
+                    'platform': 'Facebook',
+                    'platform_emoji': '👥',
+                    'is_audio': False,
+                    'format': 'jpg',
+                }
+    except Exception as e_fb_photo:
+        logger.warning(f"Error extrayendo foto de Facebook: {e_fb_photo}")
+
+    raise ValueError(
+        "🔒 Esta publicación de Facebook es privada, restringida o requiere inicio de sesión en Facebook.\n"
+        "Verifica que la publicación sea pública."
+    )
 
 
 # ==============================================================================
@@ -1193,12 +1415,14 @@ class VideoDownloader:
             except Exception as e_tt:
                 logger.warning(f"TikWM falló ({e_tt}), intentando yt-dlp como fallback...")
 
-        # 3. X / Twitter (Primary: FxTwitter API)
+        # 3. X / Twitter (Primary: FxTwitter / VxTwitter API)
         if platform_name in ("X (Twitter)", "Twitter"):
             try:
                 return download_twitter_fast(url, temp_subfolder, format_type=format_type)
             except Exception as e_tw:
-                logger.warning(f"FxTwitter falló ({e_tw}), intentando yt-dlp como fallback...")
+                if "no contiene videos ni imágenes" in str(e_tw):
+                    raise
+                logger.warning(f"APIs de X fallaron ({e_tw}), intentando yt-dlp como fallback...")
 
         # 4. Instagram
         if platform_name == "Instagram":
@@ -1221,7 +1445,11 @@ class VideoDownloader:
                     "El bot opera con arquitectura Zero-Cookies y solo puede descargar contenido accesible públicamente."
                 )
 
-        # 5. YouTube (Bridge attempt first on cloud datacenter IPs)
+        # 5. Facebook (Reels, Videos, Photos via yt-dlp + curl_cffi OpenGraph)
+        if platform_name == "Facebook":
+            return download_facebook_fast(url, temp_subfolder, format_type=format_type)
+
+        # 6. YouTube (Bridge attempt first on cloud datacenter IPs)
         if platform_name in ("YouTube", "YouTube Music"):
             bridge_res = download_youtube_bridge(url, format_type, temp_subfolder)
             if bridge_res:
