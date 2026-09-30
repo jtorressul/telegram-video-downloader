@@ -65,6 +65,11 @@ downloader = VideoDownloader(cookies_file=COOKIES_FILE)
 cache = VideoCache()
 user_db = UserDatabase()
 
+logger.info(
+    f"Configuración de Cookies: archivo={downloader.cookies_file}, "
+    f"INSTAGRAM_SESSIONID={'PRESENTE' if (os.getenv('INSTAGRAM_SESSIONID') or os.getenv('IG_SESSIONID')) else 'NO DEFINIDO'}"
+)
+
 # Concurrency limiter (4 parallel downloads)
 download_semaphore = asyncio.Semaphore(4)
 

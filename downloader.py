@@ -858,7 +858,7 @@ def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
                     new_lines.append(line)
 
     if ig_sessionid and ig_sessionid.strip():
-        sid = ig_sessionid.strip()
+        sid = ig_sessionid.strip().strip('"').strip("'").strip()
         user_id = sid.split('%3A')[0].split(':')[0]
         if user_id.isdigit():
             new_lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tds_user_id\t{user_id}")
@@ -945,7 +945,8 @@ def get_js_runtimes_config() -> Optional[Dict[str, Any]]:
 class VideoDownloader:
     def __init__(self, temp_dir: Optional[str] = None, cookies_file: Optional[str] = None):
         self.temp_dir = temp_dir or tempfile.gettempdir()
-        self.cookies_file = setup_cookies_file(cookies_file or "cookies.txt")
+        self.cookies_path_setting = cookies_file or "cookies.txt"
+        self.cookies_file = setup_cookies_file(self.cookies_path_setting)
 
     def _sync_download_spotify(self, url: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
         """Downloads high quality audio matching a Spotify track using SoundCloud (primary) or YouTube (fallback)."""
@@ -1049,6 +1050,9 @@ class VideoDownloader:
         Synchronous download execution using yt-dlp.
         Supports YouTube (MP3/MP4), TikTok, Instagram, X (Twitter), Facebook, etc.
         """
+        # Ensure fresh cookies from environment are loaded
+        self.cookies_file = setup_cookies_file(getattr(self, 'cookies_path_setting', 'cookies.txt'))
+
         if is_spotify_url(url):
             return self._sync_download_spotify(url, output_template, temp_subfolder)
 
