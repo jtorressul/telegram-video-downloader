@@ -532,6 +532,134 @@ async def set_ig_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def set_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to set YouTube cookies directly or get instructions to upload cookies.txt."""
+    user = update.effective_user
+    chat = update.effective_chat
+    is_authorized = user.id in ADMIN_IDS
+
+    if not is_authorized and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]:
+                is_authorized = True
+        except Exception:
+            pass
+
+    if not is_authorized:
+        await update.message.reply_html("❌ Solo los administradores pueden configurar cookies.")
+        return
+
+    # Delete command message if in group to keep data private
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    if not context.args:
+        await update.message.reply_html(
+            "🍪 <b>Configuración de Cookies para YouTube</b>\n\n"
+            "Tienes 2 opciones sencillas:\n\n"
+            "1️⃣ <b>Enviar el archivo (Recomendado):</b>\n"
+            "Adjunta y envía tu archivo <code>cookies.txt</code> como documento a este chat. El bot lo importará automáticamente.\n\n"
+            "2️⃣ <b>Por comando:</b>\n"
+            "Usa <code>/set_yt [contenido_de_cookies]</code>\n\n"
+            "<i>(En grupos, tus mensajes con cookies se eliminan automáticamente por seguridad).</i>"
+        )
+        return
+
+    content = " ".join(context.args).strip()
+    os.environ["YOUTUBE_COOKIES"] = content
+    from downloader import setup_cookies_file
+    updated_path = setup_cookies_file(COOKIES_FILE)
+    downloader.cookies_file = updated_path
+
+    await update.message.reply_html(
+        "✅ <b>Cookies de YouTube configuradas con éxito.</b>\n\n"
+        f"📁 Archivo: <code>{updated_path}</code>\n"
+        "🔓 Ya puedes descargar contenido protegido de YouTube."
+    )
+
+
+async def cookies_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to send a cookies.txt file directly to update YouTube/Instagram cookies."""
+    user = update.effective_user
+    chat = update.effective_chat
+    is_authorized = user.id in ADMIN_IDS
+
+    if not is_authorized and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]:
+                is_authorized = True
+        except Exception:
+            pass
+
+    if not is_authorized:
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    fname = (doc.file_name or "").lower()
+    if not (fname.endswith('.txt') or 'cookie' in fname):
+        return
+
+    # Delete message in group for security
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    status_msg = await context.bot.send_message(
+        chat_id=chat.id,
+        text="⏳ <i>Procesando archivo de cookies...</i>",
+        parse_mode="HTML"
+    )
+
+    try:
+        tg_file = await doc.get_file()
+        content_bytes = await tg_file.download_as_bytearray()
+        content_text = content_bytes.decode('utf-8', errors='ignore')
+
+        if not any(d in content_text for d in ['youtube.com', 'instagram.com', 'google.com', 'Netscape']):
+            await status_msg.edit_text("❌ El archivo no parece ser un archivo de cookies válido de Netscape.")
+            return
+
+        from downloader import setup_cookies_file
+        proj_dir = os.path.dirname(os.path.abspath(__file__))
+        c_path = os.path.join(proj_dir, COOKIES_FILE)
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(COOKIES_FILE))
+
+        for target in [c_path, tmp_path]:
+            try:
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(content_text)
+            except Exception:
+                pass
+
+        updated_path = setup_cookies_file(COOKIES_FILE)
+        downloader.cookies_file = updated_path
+
+        has_yt = 'youtube.com' in content_text
+        has_ig = 'instagram.com' in content_text
+
+        await status_msg.edit_text(
+            "✅ <b>¡Archivo de cookies actualizado con éxito!</b>\n\n"
+            f"▶️ <b>YouTube:</b> {'Activado ✅' if has_yt else 'No detectado ⚠️'}\n"
+            f"📸 <b>Instagram:</b> {'Activado ✅' if has_ig else 'No detectado ⚠️'}\n"
+            f"📁 Guardado en: <code>{updated_path}</code>\n\n"
+            "Ya puedes descargar cualquier video protegido de YouTube e Instagram.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error procesando archivo de cookies: {e}")
+        await status_msg.edit_text(f"❌ Error al procesar archivo de cookies: {e}")
+
+
 async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greets the group when added and explains features."""
     chat = update.effective_chat
@@ -1196,7 +1324,9 @@ def main():
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("vip", vip_cmd))
     app.add_handler(CommandHandler("unvip", unvip_cmd))
-    app.add_handler(CommandHandler(["set_ig", "setig", "cookie", "cookies"], set_ig_command))
+    app.add_handler(CommandHandler(["set_ig", "setig"], set_ig_command))
+    app.add_handler(CommandHandler(["set_yt", "setyt", "cookie", "cookies"], set_yt_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, cookies_document_handler))
     app.add_handler(CommandHandler(["mp3", "audio", "musica"], mp3_command))
     app.add_handler(CommandHandler(["mp4", "video"], mp4_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
