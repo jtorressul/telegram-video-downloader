@@ -1054,7 +1054,7 @@ class VideoDownloader:
                 js_cfg = get_js_runtimes_config()
                 if js_cfg:
                     yt_opts['js_runtimes'] = js_cfg
-                yt_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
+                yt_opts['extractor_args'] = {'youtube': {'player_client': ['visionos']}}
                 ydl_yt = yt_dlp.YoutubeDL(yt_opts)
                 yt_info = ydl_yt.extract_info(f"ytsearch1:{yt_query}", download=True)
                 if yt_info and 'entries' in yt_info and yt_info['entries']:
@@ -1246,19 +1246,23 @@ class VideoDownloader:
             if is_yt:
                 has_cookies = bool(self.cookies_file and os.path.exists(self.cookies_file))
                 attempts = []
-                # 1. If cookies are provided, try default client with cookies (for age-restricted or private videos)
+                # 1. VisionOS client (Bypasses YouTube datacenter/cloud IP bot blocks on Render/VPS without cookies)
+                attempts.append(("visionos (sin cookies)", ['visionos'], False))
+                # 2. Android VR client (Resilient fallback for datacenter IPs)
+                attempts.append(("android_vr (sin cookies)", ['android_vr'], False))
+                # 3. If cookies are provided, try with cookies (for age-restricted or private videos)
                 if has_cookies:
                     attempts.append(("default (con cookies)", None, True))
-                # 2. Clean default client WITHOUT cookies (bypasses expired, reload-flagged, or SABR-restricted cookies)
+                # 4. Clean default client WITHOUT cookies
                 attempts.append(("default (sin cookies)", None, False))
-                # 3. Android client WITHOUT cookies (android never supports cookies, highly resilient)
+                # 5. Android client WITHOUT cookies
                 attempts.append(("android (sin cookies)", ['android'], False))
-                # 4. Web client WITHOUT cookies
+                # 6. Web client WITHOUT cookies
                 attempts.append(("web (sin cookies)", ['web'], False))
-                # 5. Web client with cookies (if cookies exist)
+                # 7. Web client with cookies (if cookies exist)
                 if has_cookies:
                     attempts.append(("web (con cookies)", ['web'], True))
-                # 6. iOS client WITHOUT cookies
+                # 8. iOS client WITHOUT cookies
                 attempts.append(("ios (sin cookies)", ['ios'], False))
             else:
                 attempts = [("default", None, bool(self.cookies_file))]
