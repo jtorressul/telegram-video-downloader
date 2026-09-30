@@ -33,12 +33,9 @@ logger = logging.getLogger(__name__)
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024
 TARGET_COMPRESSION_BYTES = 45 * 1024 * 1024
 
-# Public Cobalt instances pool for bridge downloads
-COBALT_INSTANCES = [
-    "https://api.cobalt.tools",
-    "https://cobalt-api.kwiatekm.tokyo",
-    "https://api.cobalt.lol",
-]
+# Public/Custom Cobalt instances pool for bridge downloads (configurable via COBALT_API_URL)
+_custom_cobalt = os.getenv("COBALT_API_URL", "").strip()
+COBALT_INSTANCES = [_custom_cobalt] if _custom_cobalt else []
 
 
 def extract_youtube_id(url: str) -> Optional[str]:
@@ -291,9 +288,10 @@ def download_tiktok_fast(url: str, format_type: str, temp_subfolder: str) -> Dic
         msg = data.get('msg') if data else str(last_err or "Error de conexión con TikWM")
         raise ValueError(f"No se pudo descargar el video de TikTok: {msg}")
 
-    item = data.get('data', {})
+    item = data.get('data') or {}
     title = item.get('title') or "Video de TikTok"
-    author = item.get('author', {}).get('nickname') or item.get('author', {}).get('unique_id') or "TikTok"
+    author_obj = item.get('author') or {}
+    author = author_obj.get('nickname') or author_obj.get('unique_id') or "TikTok"
     duration = item.get('duration') or 0
     cover_url = item.get('cover')
 
@@ -601,7 +599,7 @@ def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: 
                 'fb_api_req_friendly_name': 'PolarisLoggedOutDesktopWWWPostRootContentQuery',
                 'server_timestamps': 'true',
                 'variables': json.dumps({'media_id': media_id_str}, separators=(',', ':')),
-                'doc_id': '27130156389949648',
+                'doc_id': '28256812867323632',
             }
 
             gql_resp = session.post(
@@ -613,18 +611,15 @@ def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: 
 
             if gql_resp.status_code == 200:
                 gql_json = gql_resp.json()
-                product = (
-                    (gql_json.get('data') or {})
-                    .get('xig_polaris_media', {})
-                    .get('if_not_gated_logged_out')
-                )
+                media_node = (gql_json.get('data') or {}).get('xig_polaris_media') or {}
+                product = media_node.get('if_not_gated_logged_out')
                 if product:
                     media_data = product
                     caption = (product.get('caption') or {}).get('text') or caption
                     author = (product.get('user') or {}).get('username') or author
-                    logger.info(f"✅ Instagram extraído exitosamente vía Polaris GraphQL (0 Cookies).")
+                    logger.info("✅ Instagram extraído exitosamente vía Polaris GraphQL (0 Cookies).")
         except Exception as e_polaris:
-            logger.warning(f"Intento Polaris GraphQL falló: {e_polaris}")
+            logger.warning(f"Intento Polaris GraphQL no obtuvo el medio: {e_polaris}")
 
     # Layer 2: Cobalt Public Bridge
     if not media_data:
@@ -1028,13 +1023,17 @@ class VideoDownloader:
             except Exception as e_tw:
                 logger.warning(f"FxTwitter falló ({e_tw}), intentando yt-dlp como fallback...")
 
-        # 4. Instagram (Primary: Zero-Cookies Polaris GraphQL + Bridge)
+        # 4. Instagram (100% Zero-Cookies Polaris GraphQL + Bridge)
         if platform_name == "Instagram":
             norm_url = normalize_instagram_url(url)
             try:
                 return download_instagram_zero_cookies(norm_url, temp_subfolder, format_type=format_type)
             except Exception as e_ig:
-                logger.warning(f"Instagram Zero-Cookies falló ({e_ig}), intentando yt-dlp fallback...")
+                logger.warning(f"Instagram Zero-Cookies no pudo extraer el medio: {e_ig}")
+                raise ValueError(
+                    "🔒 Este contenido de Instagram es privado, restringido por edad o requiere inicio de sesión en su plataforma.\n"
+                    "El bot opera con arquitectura Zero-Cookies y solo puede descargar contenido accesible públicamente."
+                )
 
         # 5. YouTube (Bridge attempt first on cloud datacenter IPs)
         if platform_name in ("YouTube", "YouTube Music"):
@@ -1114,7 +1113,12 @@ class VideoDownloader:
                 continue
 
         if not info:
-            raise ValueError(f"No se pudo descargar el contenido: {last_error or 'Error de extracción'}")
+            raw_err = str(last_error or 'Error de extracción')
+            if any(k in raw_err.lower() for k in ['cookies', 'empty media response', 'login', 'private', 'sign in', 'confirm your age']):
+                clean_err = "Este contenido es privado, restringido o requiere inicio de sesión en la plataforma."
+            else:
+                clean_err = raw_err
+            raise ValueError(f"No se pudo descargar el contenido: {clean_err}")
 
         if 'entries' in info and info['entries']:
             video_entries = [
