@@ -73,7 +73,6 @@ class VideoCache:
 
     def _make_key(self, video_id_or_url: str, format_type: str = "mp4") -> str:
         fmt = format_type.lower().strip()
-        # If it's already an 11-char ID
         if len(video_id_or_url) == 11 and not ('/' in video_id_or_url or '.' in video_id_or_url):
             return f"{video_id_or_url}:{fmt}"
         clean = normalize_url(video_id_or_url)

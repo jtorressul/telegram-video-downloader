@@ -116,7 +116,6 @@ class UserDatabase:
                 cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
                 row = cur.fetchone()
             else:
-                # Update username or first_name if changed
                 updates = []
                 params = []
                 if username and row['username'] != username:
@@ -126,7 +125,6 @@ class UserDatabase:
                     updates.append("first_name = ?")
                     params.append(first_name)
 
-                # Daily quota reset if date changed (12:00 AM boundary)
                 if row['last_download_date'] != today_str:
                     updates.append("daily_downloads = 0")
                     updates.append("last_download_date = ?")

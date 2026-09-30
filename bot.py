@@ -4,6 +4,7 @@ import html
 import asyncio
 import logging
 import threading
+import tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from dotenv import load_dotenv
@@ -61,14 +62,9 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip()
 ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip().isdigit()]
 
 # Initialize services
-downloader = VideoDownloader(cookies_file=COOKIES_FILE)
+downloader = VideoDownloader(cookies_file=COOKIES_FILE if os.path.exists(COOKIES_FILE) else None)
 cache = VideoCache()
 user_db = UserDatabase()
-
-logger.info(
-    f"Configuración de Cookies: archivo={downloader.cookies_file}, "
-    f"INSTAGRAM_SESSIONID={'PRESENTE' if (os.getenv('INSTAGRAM_SESSIONID') or os.getenv('IG_SESSIONID')) else 'NO DEFINIDO'}"
-)
 
 # Concurrency limiter (4 parallel downloads)
 download_semaphore = asyncio.Semaphore(4)
@@ -82,7 +78,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Downloader Bot con Sistema VIP activo.")
+        self.wfile.write(b"OK - Downloader Bot con Sistema VIP y Arquitectura Zero-Cookies activa.")
 
     def log_message(self, format, *args):
         pass
@@ -97,7 +93,7 @@ def start_health_server():
             server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
-            logger.info(f"Servidor web de salud iniciado en el puerto {port}")
+            logger.info(f"✅ Servidor web de salud iniciado en el puerto {port}")
         except Exception as e:
             logger.warning(f"No se pudo iniciar el servidor web de salud: {e}")
 
@@ -113,7 +109,6 @@ async def schedule_midnight_quota_reset():
     while True:
         try:
             now = get_local_now()
-            # Calculate next midnight (00:00:00) in local timezone
             tomorrow = now.date() + dt.timedelta(days=1)
             next_midnight = dt.datetime.combine(tomorrow, dt.time.min, tzinfo=now.tzinfo)
             wait_seconds = (next_midnight - now).total_seconds()
@@ -122,7 +117,6 @@ async def schedule_midnight_quota_reset():
                 f"({next_midnight.strftime('%Y-%m-%d %H:%M:%S %Z')}), esperando {wait_seconds:.1f}s."
             )
             await asyncio.sleep(max(1.0, wait_seconds))
-            # Sleep 2 extra seconds to ensure date rollover is complete
             await asyncio.sleep(2.0)
 
             count = user_db.reset_all_daily_quotas()
@@ -168,7 +162,7 @@ async def sync_user_vip_status(
     Checks member status/custom title in group.
     - If user is in ADMIN_IDS -> VIP
     - If user is Creator / Owner of the group -> VIP
-    - If user custom_title contains 'VIP' (e.g. 'DROGUITA - VIP', 'MIYAGIPEOS - VIP') -> VIP
+    - If user custom_title contains 'VIP' (e.g. 'DROGUITA - VIP', 'ALFREDO PC - VIP') -> VIP
     - If user is Administrator with title 'ADMIN' or is Group Admin -> VIP
     - If regular member without VIP title -> NO VIP PASS
     """
@@ -185,8 +179,6 @@ async def sync_user_vip_status(
         is_creator = status in ['creator', 'owner', ChatMemberStatus.OWNER]
         is_admin = status in ['administrator', ChatMemberStatus.ADMINISTRATOR]
         custom_title = (getattr(member, 'custom_title', '') or '').strip().upper()
-
-        logger.info(f"Sync VIP chat={chat_id}, user={user_id}: status={status}, title='{custom_title}'")
 
         if is_creator or 'VIP' in custom_title or 'ADMIN' in custom_title or is_admin:
             user_db.set_vip_status(user_id, True, username, first_name)
@@ -211,7 +203,6 @@ async def sync_user_vip_from_all_groups(
         user_db.set_vip_status(user_id, True, username, first_name)
         return True
 
-    # If already marked VIP in DB, preserve it
     user = user_db.get_or_create_user(user_id, username, first_name)
     if user.get('is_vip'):
         return True
@@ -225,7 +216,6 @@ async def sync_user_vip_from_all_groups(
         except Exception:
             continue
     return False
-
 
 
 async def keep_chat_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: ChatAction, stop_event: asyncio.Event):
@@ -313,7 +303,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 ¡Hola a todos! Soy el bot descargador de videos y música.\n\n"
             "✨ <b>Condiciones del Grupo:</b>\n"
             f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas diarias (X, Instagram, TikTok).\n"
-            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas diarias (Todas las plataformas: YouTube, Facebook, etc.).\n\n"
+            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas diarias (Todas las plataformas: YouTube, Facebook, Spotify, etc.).\n\n"
             "🧹 <i>Con permisos de Administrador (Eliminar mensajes), borro los enlaces automáticamente.</i>",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -323,7 +313,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 ¡Hola, <b>{name}</b>!\n\n"
-        "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b>.\n\n"
+        "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b> y arquitectura <b>Zero-Cookies</b>.\n\n"
         "✨ <b>Niveles de Membresía:</b>\n"
         f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas al día (Instagram, TikTok, X).\n"
         f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas al día (Todas las plataformas: YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
@@ -359,7 +349,7 @@ async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Añade este bot a cualquier grupo para activar el sistema de descargas con soporte VIP.\n\n"
         "⚡ <b>Condiciones Oficiales:</b>\n"
         f"• 🆓 <b>NO VIP PASS:</b> Límite de {NO_VIP_DAILY_LIMIT} descargas diarias (X, Instagram, TikTok).\n"
-        f"• 👑 <b>VIP:</b> Límite de {VIP_DAILY_LIMIT} descargas diarias (YouTube, Facebook, X, IG, TikTok).\n"
+        f"• 👑 <b>VIP:</b> Límite de {VIP_DAILY_LIMIT} descargas diarias (YouTube, Facebook, X, IG, TikTok, Spotify).\n"
         "• <b>Detección automática:</b> Los miembros con título '- VIP' en el grupo son reconocidos automáticamente.\n"
         "• <b>Limpieza de chat:</b> Elimina el mensaje del link una vez enviado el archivo."
     )
@@ -416,10 +406,10 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /about command."""
     about_text = (
         "ℹ️ <b>Acerca de este Bot:</b>\n\n"
-        "🤖 <b>Versión:</b> 3.0.0 (Sistema VIP & Estadísticas)\n"
-        "⚡ <b>Motor:</b> yt-dlp + FFmpeg\n"
-        "🗄️ <b>Base de Datos:</b> SQLite para Usuarios, Cuotas y Caché de medios\n"
-        "🧹 <b>Auto-Limpieza:</b> Borra links en grupos y mantiene el chat limpio."
+        "🤖 <b>Versión:</b> 4.0.0 (Zero-Cookies & Anti-Bloqueo Render)\n"
+        "⚡ <b>Motor:</b> TikWM + FxTwitter + Polaris GraphQL + Mutagen + yt-dlp\n"
+        "🗄️ <b>Base de Datos:</b> SQLite para Usuarios, Cuotas y Caché instantánea\n"
+        "🧹 <b>Auto-Limpieza:</b> Borra links en grupos y mantiene el chat ordenado."
     )
 
     keyboard = [
@@ -483,236 +473,50 @@ async def unvip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await vip_management_command(update, context, False)
 
 
-async def set_ig_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows admins to set or update Instagram session cookie directly via chat."""
-    user = update.effective_user
-    chat = update.effective_chat
-    is_authorized = user.id in ADMIN_IDS
+async def direct_format_command(update: Update, context: ContextTypes.DEFAULT_TYPE, forced_format: str):
+    """Handler for /mp3 or /mp4 direct commands."""
+    text = " ".join(context.args) if context.args else ""
+    urls = URL_REGEX.findall(text)
 
-    if not is_authorized and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        try:
-            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
-            if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]:
-                is_authorized = True
-        except Exception:
-            pass
+    if not urls and update.message.reply_to_message:
+        reply_text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
+        urls = URL_REGEX.findall(reply_text)
 
-    if not is_authorized:
-        await update.message.reply_html("❌ Solo los administradores pueden configurar la sesión de Instagram.")
-        return
-
-    # Delete command message if in group to keep cookie secret
-    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-    if not context.args:
+    if not urls:
         await update.message.reply_html(
-            "ℹ️ <b>Uso:</b> <code>/set_ig TU_SESSION_ID</code>\n\n"
-            "Ejemplo: <code>/set_ig 11702076966%3AoJDj7KwxfUam8r...</code>\n\n"
-            "<i>(En grupos, el bot borra automáticamente tu mensaje para proteger la clave).</i>"
+            f"ℹ️ <b>Uso del comando:</b>\n<code>/{forced_format} [enlace de video o música]</code>"
         )
         return
 
-    sid = context.args[0].strip().strip('"').strip("'").strip()
-    if sid.lower() in ("clear", "reset", "delete", "borrar", "limpiar"):
-        os.environ.pop("INSTAGRAM_SESSIONID", None)
-        proj_dir = os.path.dirname(os.path.abspath(__file__))
-        c_path = os.path.join(proj_dir, COOKIES_FILE)
-        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(COOKIES_FILE))
-        for p in [c_path, tmp_path]:
-            if os.path.exists(p):
-                try:
-                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = [
-                            l for l in f
-                            if not any(d in l.lower() for d in ['instagram.com', 'instagr.am'])
-                        ]
-                    with open(p, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception:
-                    pass
-        from downloader import setup_cookies_file
-        updated_path = setup_cookies_file(COOKIES_FILE)
-        downloader.cookies_file = updated_path
-        await update.message.reply_html("🗑️ <b>Sesión de Instagram eliminada con éxito.</b>")
-        return
-
-    if "sessionid=" in sid:
-        sid = sid.split("sessionid=")[1].split(";")[0].strip()
-
-    os.environ["INSTAGRAM_SESSIONID"] = sid
-    from downloader import setup_cookies_file
-    updated_path = setup_cookies_file(COOKIES_FILE)
-    downloader.cookies_file = updated_path
-
-    await update.message.reply_html(
-        "✅ <b>Sesión de Instagram configurada y guardada con éxito.</b>\n\n"
-        f"📁 Archivo: <code>{updated_path}</code>\n"
-        "🔓 Ya puedes descargar cualquier Reel o publicación de Instagram con restricción."
-    )
-
-
-async def set_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows admins to set YouTube cookies directly, clear them, or get instructions to upload cookies.txt."""
+    url = urls[0].strip()
     user = update.effective_user
     chat = update.effective_chat
-    is_authorized = user.id in ADMIN_IDS
+    is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+    user_mention = user.mention_html() if user else "Usuario"
 
-    if not is_authorized and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        try:
-            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
-            if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]:
-                is_authorized = True
-        except Exception:
-            pass
-
-    if not is_authorized:
-        await update.message.reply_html("❌ Solo los administradores pueden configurar cookies.")
-        return
-
-    # Delete command message if in group to keep data private
-    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-    if not context.args:
-        await update.message.reply_html(
-            "🍪 <b>Configuración de Cookies para YouTube</b>\n\n"
-            "Tienes 3 opciones sencillas:\n\n"
-            "1️⃣ <b>Enviar el archivo (Recomendado):</b>\n"
-            "Adjunta y envía tu archivo <code>cookies.txt</code> como documento a este chat. El bot lo importará automáticamente.\n\n"
-            "2️⃣ <b>Por comando:</b>\n"
-            "Usa <code>/set_yt [contenido_de_cookies]</code>\n\n"
-            "3️⃣ <b>Limpiar cookies de YouTube:</b>\n"
-            "Usa <code>/set_yt clear</code> para eliminar las cookies de YouTube y descargar de forma directa y limpia.\n\n"
-            "<i>(En grupos, tus mensajes con cookies se eliminan automáticamente por seguridad).</i>"
-        )
-        return
-
-    content = " ".join(context.args).strip()
-    if content.lower() in ("clear", "reset", "delete", "eliminar", "borrar"):
-        os.environ.pop("YOUTUBE_COOKIES", None)
-        proj_dir = os.path.dirname(os.path.abspath(__file__))
-        c_path = os.path.join(proj_dir, COOKIES_FILE)
-        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(COOKIES_FILE))
-        for p in [c_path, tmp_path]:
-            if os.path.exists(p):
-                try:
-                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = [
-                            l for l in f
-                            if not any(d in l.lower() for d in ['youtube.com', 'google.com'])
-                        ]
-                    with open(p, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception:
-                    pass
-        from downloader import setup_cookies_file
-        updated_path = setup_cookies_file(COOKIES_FILE)
-        downloader.cookies_file = updated_path
-        await update.message.reply_html(
-            "🗑️ <b>Cookies de YouTube eliminadas con éxito.</b>\n\n"
-            "El bot descargará YouTube de forma directa y limpia sin cookies de sesión."
-        )
-        return
-
-    os.environ["YOUTUBE_COOKIES"] = content
-    from downloader import setup_cookies_file
-    updated_path = setup_cookies_file(COOKIES_FILE)
-    downloader.cookies_file = updated_path
-
-    await update.message.reply_html(
-        "✅ <b>Cookies de YouTube configuradas con éxito.</b>\n\n"
-        f"📁 Archivo: <code>{updated_path}</code>\n"
-        "🔓 Ya puedes descargar contenido protegido de YouTube."
-    )
-
-
-async def cookies_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows admins to send a cookies.txt file directly to update YouTube/Instagram cookies."""
-    user = update.effective_user
-    chat = update.effective_chat
-    is_authorized = user.id in ADMIN_IDS
-
-    if not is_authorized and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        try:
-            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
-            if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]:
-                is_authorized = True
-        except Exception:
-            pass
-
-    if not is_authorized:
-        return
-
-    doc = update.message.document
-    if not doc:
-        return
-
-    fname = (doc.file_name or "").lower()
-    if not (fname.endswith('.txt') or 'cookie' in fname):
-        return
-
-    # Delete message in group for security
-    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-    status_msg = await context.bot.send_message(
+    await execute_download(
+        context=context,
         chat_id=chat.id,
-        text="⏳ <i>Procesando archivo de cookies...</i>",
-        parse_mode="HTML"
+        user_id=user.id,
+        user_mention=user_mention,
+        url=url,
+        format_type=forced_format,
+        status_message=None,
+        original_message=update.message,
+        is_group=is_group,
     )
 
-    try:
-        tg_file = await doc.get_file()
-        content_bytes = await tg_file.download_as_bytearray()
-        content_text = content_bytes.decode('utf-8', errors='ignore')
 
-        if not any(d in content_text for d in ['youtube.com', 'instagram.com', 'google.com', 'Netscape']):
-            await status_msg.edit_text("❌ El archivo no parece ser un archivo de cookies válido de Netscape.")
-            return
+async def mp3_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await direct_format_command(update, context, "mp3")
 
-        from downloader import setup_cookies_file
-        proj_dir = os.path.dirname(os.path.abspath(__file__))
-        c_path = os.path.join(proj_dir, COOKIES_FILE)
-        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(COOKIES_FILE))
 
-        for target in [c_path, tmp_path]:
-            try:
-                with open(target, "w", encoding="utf-8") as f:
-                    f.write(content_text)
-            except Exception:
-                pass
-
-        updated_path = setup_cookies_file(COOKIES_FILE)
-        downloader.cookies_file = updated_path
-
-        has_yt = 'youtube.com' in content_text
-        has_ig = 'instagram.com' in content_text
-
-        await status_msg.edit_text(
-            "✅ <b>¡Archivo de cookies actualizado con éxito!</b>\n\n"
-            f"▶️ <b>YouTube:</b> {'Activado ✅' if has_yt else 'No detectado ⚠️'}\n"
-            f"📸 <b>Instagram:</b> {'Activado ✅' if has_ig else 'No detectado ⚠️'}\n"
-            f"📁 Guardado en: <code>{updated_path}</code>\n\n"
-            "Ya puedes descargar cualquier video protegido de YouTube e Instagram.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Error procesando archivo de cookies: {e}")
-        await status_msg.edit_text(f"❌ Error al procesar archivo de cookies: {e}")
+async def mp4_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await direct_format_command(update, context, "mp4")
 
 
 async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Greets the group when added and explains features."""
+    """Greets the group when added and registers it."""
     chat = update.effective_chat
     if chat and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
         user_db.register_group(chat.id, chat.title)
@@ -757,7 +561,7 @@ async def execute_download(
         url = normalize_instagram_url(url)
     clean_url = html.escape(url)
 
-    # 1. Quota & Permission Verification (Enforced both in private and groups)
+    # 1. Quota & Permission Verification
     allowed, reason, user_data = user_db.check_download_permission(user_id, platform)
     if not allowed:
         if status_message:
@@ -789,7 +593,7 @@ async def execute_download(
             await context.bot.send_message(chat_id=chat_id, text=limit_text, parse_mode=ParseMode.HTML)
             return
 
-    # 2. Check cache for instant delivery
+    # 2. Check cache for instant delivery (<0.5s)
     cache_key = extract_youtube_id(url) if is_yt else url
     cached_data = cache.get(cache_key, format_type)
     if cached_data:
@@ -854,7 +658,6 @@ async def execute_download(
                     supports_streaming=True,
                 )
 
-            # Record stats
             user_db.record_download_success(user_id, platform)
 
             if status_message:
@@ -1001,7 +804,7 @@ async def execute_download(
                         media_type='photo',
                     )
 
-        elif res_type == 'album':
+        elif res_type in ['album', 'carousel']:
             caption = (
                 f"📸 <b>{clean_title}</b>\n\n"
                 f"{emoji} <b>Plataforma:</b> {platform}\n"
@@ -1099,16 +902,13 @@ async def execute_download(
                     if thumb_fp:
                         thumb_fp.close()
 
-        # Successfully downloaded & sent -> record stats
         user_db.record_download_success(user_id, platform)
 
-        # Delete progress message
         try:
             await status_message.delete()
         except Exception:
             pass
 
-        # In groups: Delete the original message containing the link!
         if is_group and original_message:
             try:
                 await original_message.delete()
@@ -1193,7 +993,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = html.escape(user.first_name) if user and user.first_name else "amigo"
         welcome_text = (
             f"👋 ¡Hola, <b>{name}</b>!\n\n"
-            "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b>.\n\n"
+            "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b> y arquitectura <b>Zero-Cookies</b>.\n\n"
             "✨ <b>Niveles de Membresía:</b>\n"
             f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día (Instagram, TikTok, X).\n"
             f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día (YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
@@ -1234,64 +1034,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(cmd_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
 
 
-async def direct_format_command(update: Update, context: ContextTypes.DEFAULT_TYPE, forced_format: str):
-    """Handler for /mp3 or /mp4 direct commands."""
-    text = " ".join(context.args) if context.args else ""
-    urls = URL_REGEX.findall(text)
-
-    if not urls and update.message.reply_to_message:
-        reply_text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-        urls = URL_REGEX.findall(reply_text)
-
-    if not urls:
-        await update.message.reply_html(
-            f"ℹ️ <b>Uso del comando:</b>\n<code>/{forced_format} [enlace de video o música]</code>"
-        )
-        return
-
-    url = urls[0].strip()
-    user = update.effective_user
-    chat = update.effective_chat
-    is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
-
-    if is_group:
-        await sync_user_vip_status(context, chat.id, user.id, user.username, user.first_name, chat.title)
-    else:
-        await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
-
-    user_mention = user.mention_html() if user else "Usuario"
-
-    await execute_download(
-        context=context,
-        chat_id=chat.id,
-        user_id=user.id,
-        user_mention=user_mention,
-        url=url,
-        format_type=forced_format,
-        status_message=None,
-        original_message=update.message,
-        is_group=is_group,
-    )
-
-
-async def mp3_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await direct_format_command(update, context, "mp3")
-
-
-async def mp4_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await direct_format_command(update, context, "mp4")
-
-
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming messages from users and groups."""
+    """Processes incoming messages to detect media links."""
+    chat = update.effective_chat
+    user = update.effective_user
     if not update.message:
         return
 
-    user = update.effective_user
-    chat = update.effective_chat
     is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
 
-    # Sync VIP status in group or private
     if is_group:
         await sync_user_vip_status(context, chat.id, user.id, user.username, user.first_name, chat.title)
     else:
@@ -1305,7 +1056,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_username = await get_bot_username(context)
             await update.message.reply_html(
                 "ℹ️ <b>Enlace no detectado.</b>\n\n"
-                "Por favor, envíame un enlace de <b>Instagram, TikTok, X, YouTube o Facebook</b>.",
+                "Por favor, envíame un enlace de <b>Instagram, TikTok, X, YouTube, Spotify o Facebook</b>.",
                 reply_markup=get_start_keyboard(bot_username)
             )
         return
@@ -1327,10 +1078,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Spotify defaults to MP3 audio, others to MP4 video
     forced_format = "mp3" if is_spotify else "mp4"
 
-    # For other platforms (Instagram, TikTok, X, Facebook, Spotify): start download directly
     await execute_download(
         context=context,
         chat_id=chat.id,
@@ -1346,7 +1095,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Main entrypoint for the Telegram bot."""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "TU_TOKEN_DE_TELEGRAM_AQUI":
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "TU_TOKEN_AQUI":
         print("\n" + "=" * 60)
         print("❌ ERROR: TELEGRAM_BOT_TOKEN no está configurado.")
         print("1. Abre el archivo .env en esta carpeta.")
@@ -1355,7 +1104,7 @@ def main():
         print("=" * 60 + "\n")
         return
 
-    print("🚀 Iniciando Bot con Sistema VIP, Estadísticas (/stats) y Control de Cuotas...")
+    print("🚀 Iniciando Bot con Sistema VIP, Estadísticas (/stats) y Arquitectura Zero-Cookies...")
     start_health_server()
 
     request = HTTPXRequest(
@@ -1375,9 +1124,6 @@ def main():
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("vip", vip_cmd))
     app.add_handler(CommandHandler("unvip", unvip_cmd))
-    app.add_handler(CommandHandler(["set_ig", "setig"], set_ig_command))
-    app.add_handler(CommandHandler(["set_yt", "setyt", "cookie", "cookies"], set_yt_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, cookies_document_handler))
     app.add_handler(CommandHandler(["mp3", "audio", "musica"], mp3_command))
     app.add_handler(CommandHandler(["mp4", "video"], mp4_command))
     app.add_handler(CallbackQueryHandler(callback_handler))

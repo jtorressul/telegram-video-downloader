@@ -1,22 +1,22 @@
 FROM python:3.11-slim
 
-# Install ffmpeg, ca-certificates, curl, and nodejs (for yt-dlp JS challenges)
+# Instalar dependencias del sistema: FFmpeg para audio/video, Node.js para yt-dlp-ejs y curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    ca-certificates \
-    curl \
     nodejs \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies
+# Instalar dependencias de Python
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# Copiar el código del bot
 COPY . .
 
-# Run bot
+# Puerto para health checks de Render
+EXPOSE 8080
+
 CMD ["python", "bot.py"]

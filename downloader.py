@@ -8,28 +8,50 @@ import asyncio
 import logging
 import subprocess
 import urllib.request
-from urllib.parse import urlparse, parse_qs
-from typing import Dict, Any, Optional, Tuple
+import urllib.parse
+from typing import Dict, Any, Optional, Tuple, List
+
 import yt_dlp
+
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    cffi_requests = None
+    HAS_CURL_CFFI = False
+
+try:
+    import mutagen
+    from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC
+    HAS_MUTAGEN = True
+except ImportError:
+    HAS_MUTAGEN = False
 
 logger = logging.getLogger(__name__)
 
-# Telegram Bot API limits standard bots to 50MB for upload
-MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
-TARGET_COMPRESSION_BYTES = 45 * 1024 * 1024  # 45 MB
+# Telegram Bot API limit: 50MB
+MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024
+TARGET_COMPRESSION_BYTES = 45 * 1024 * 1024
+
+# Public Cobalt instances pool for bridge downloads
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt-api.kwiatekm.tokyo",
+    "https://api.cobalt.lol",
+]
 
 
 def extract_youtube_id(url: str) -> Optional[str]:
-    """Extracts 11-character YouTube video ID supporting all formats and arbitrary query parameters."""
+    """Extracts 11-character YouTube video ID."""
     if not url:
         return None
     try:
-        parsed = urlparse(url)
+        parsed = urllib.parse.urlparse(url)
         netloc = parsed.netloc.lower()
         path = parsed.path
         if any(d in netloc for d in ['youtube.com', 'youtu.be']):
             if path in ['/watch', '/watch_popup']:
-                qs = parse_qs(parsed.query)
+                qs = urllib.parse.parse_qs(parsed.query)
                 v = qs.get('v')
                 if v and len(v[0]) == 11:
                     return v[0]
@@ -44,7 +66,6 @@ def extract_youtube_id(url: str) -> Optional[str]:
     except Exception:
         pass
 
-    # Regex fallback
     m = re.search(r'(?:[?&]v=|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})', url)
     return m.group(1) if m else None
 
@@ -96,8 +117,22 @@ def detect_platform(url: str) -> Tuple[str, str]:
         return "Web Video", "🌐"
 
 
+def normalize_instagram_url(url: str) -> str:
+    """Extracts clean canonical Instagram post or reel URL."""
+    m = re.search(r'(?:instagram\.com|instagr\.am|ig\.me)/(?:p|reel|reels|tv)/([a-zA-Z0-9_-]+)', url)
+    if m:
+        return f"https://www.instagram.com/reel/{m.group(1)}/"
+    return url
+
+
+def extract_instagram_shortcode(url: str) -> Optional[str]:
+    """Extracts shortcode from Instagram URL."""
+    m = re.search(r'(?:instagram\.com|instagr\.am|ig\.me)/(?:p|reel|reels|tv|share/reel)/([a-zA-Z0-9_-]+)', url)
+    return m.group(1) if m else None
+
+
 def get_spotify_info(url: str) -> Dict[str, str]:
-    """Extracts track title, artist, and cover art from a Spotify URL."""
+    """Extracts track title, artist, and cover art from a Spotify URL using oEmbed."""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     req = urllib.request.Request(url, headers=headers)
     try:
@@ -110,67 +145,58 @@ def get_spotify_info(url: str) -> Dict[str, str]:
     thumbnail_url = ""
     artist = ""
 
-    # 1. Try Spotify oEmbed
     try:
-        oembed_url = f"https://open.spotify.com/oembed?url={final_url}"
+        oembed_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(final_url)}"
         req_oe = urllib.request.Request(oembed_url, headers=headers)
         with urllib.request.urlopen(req_oe, timeout=10) as oe_resp:
             oe_data = json.loads(oe_resp.read().decode('utf-8'))
-            title = oe_data.get('title', '')
+            raw_title = oe_data.get('title', '')
             thumbnail_url = oe_data.get('thumbnail_url', '')
-    except Exception:
-        pass
 
-    # 2. Extract track id and fetch embed page for artist
-    track_match = re.search(r'track/([a-zA-Z0-9]+)', final_url)
-    if track_match:
-        track_id = track_match.group(1)
-        embed_url = f"https://open.spotify.com/embed/track/{track_id}"
-        try:
-            req_embed = urllib.request.Request(embed_url, headers=headers)
-            with urllib.request.urlopen(req_embed, timeout=10) as em_resp:
-                html_data = em_resp.read().decode('utf-8')
-                m = re.search(r'<script id=\"__NEXT_DATA__\"[^>]*>([^<]+)</script>', html_data)
-                if m:
-                    parsed = json.loads(m.group(1))
-                    entity = parsed['props']['pageProps']['state']['data']['entity']
-                    artists = entity.get('artists', [])
-                    if artists:
-                        artist = ', '.join([a.get('name') for a in artists if a.get('name')])
-                    if not title:
-                        title = entity.get('name', '')
-        except Exception:
-            pass
+            # Parse "Title by Artist" or "Artist - Title"
+            if ' by ' in raw_title:
+                parts = raw_title.split(' by ')
+                title = parts[0].strip()
+                artist = parts[1].strip()
+            elif ' - ' in raw_title:
+                parts = raw_title.split(' - ')
+                artist = parts[0].strip()
+                title = parts[1].strip()
+            else:
+                title = raw_title
+    except Exception as e:
+        logger.warning(f"Error reading Spotify oEmbed: {e}")
 
     return {
-        'title': title or 'Canción de Spotify',
-        'artist': artist or 'Artista Desconocido',
-        'thumbnail_url': thumbnail_url
+        'title': title or "Spotify Track",
+        'artist': artist or "Artista",
+        'thumbnail_url': thumbnail_url or ""
     }
 
 
 def convert_thumbnail_to_jpg(thumb_path: Optional[str], video_path: str, output_dir: str) -> Optional[str]:
-    """Ensures the thumbnail is a JPG format acceptable by Telegram."""
-    target_thumb = os.path.join(output_dir, 'thumb_tg.jpg')
-
-    if thumb_path and os.path.exists(thumb_path):
-        if thumb_path.lower().endswith(('.jpg', '.jpeg')):
+    """Converts thumbnail to JPG for Telegram compatibility."""
+    if thumb_path and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+        base, ext = os.path.splitext(thumb_path)
+        if ext.lower() in ['.jpg', '.jpeg']:
             return thumb_path
+        target_path = os.path.join(output_dir, f"thumb_{os.path.basename(base)}.jpg")
+        cmd = ['ffmpeg', '-y', '-i', thumb_path, '-frames:v', '1', target_path]
         try:
-            cmd = ['ffmpeg', '-y', '-i', thumb_path, '-vf', 'scale=320:-1', '-q:v', '3', target_thumb]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-            if res.returncode == 0 and os.path.exists(target_thumb) and os.path.getsize(target_thumb) > 0:
-                return target_thumb
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            if res.returncode == 0 and os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                return target_path
         except Exception:
             pass
 
-    # Fallback from video
-    if video_path and os.path.exists(video_path) and not video_path.lower().endswith('.mp3'):
+    # Extract frame from video if available
+    if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+        target_path = os.path.join(output_dir, "frame_thumb.jpg")
+        cmd = ['ffmpeg', '-y', '-ss', '00:00:01', '-i', video_path, '-vframes', '1', '-q:v', '2', target_path]
         try:
-            cmd = ['ffmpeg', '-y', '-ss', '00:00:01', '-i', video_path, '-vframes', '1', '-vf', 'scale=320:-1', '-q:v', '3', target_thumb]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-            if res.returncode == 0 and os.path.exists(target_thumb) and os.path.getsize(target_thumb) > 0:
-                return target_thumb
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            if res.returncode == 0 and os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                return target_path
         except Exception:
             pass
 
@@ -181,51 +207,88 @@ def compress_video_ffmpeg(input_file: str, output_file: str, duration: float) ->
     """Compresses video to fit within Telegram's 50MB limit."""
     if duration <= 0:
         return False
+    target_bits = TARGET_COMPRESSION_BYTES * 8
+    target_total_bitrate = int(target_bits / duration)
+    audio_bitrate = 96 * 1000
+    video_bitrate = max(150 * 1000, target_total_bitrate - audio_bitrate)
 
-    total_bitrate = int((TARGET_COMPRESSION_BYTES * 8) / duration)
-    audio_bitrate = 96 * 1000 if duration > 600 else 128 * 1000
-    video_bitrate = max(total_bitrate - audio_bitrate, 100 * 1000)
+    cmd = [
+        'ffmpeg', '-y', '-i', input_file,
+        '-c:v', 'libx264', '-b:v', str(video_bitrate),
+        '-preset', 'veryfast',
+        '-c:a', 'aac', '-b:a', '96k',
+        output_file
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
+        return res.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0
+    except Exception as e:
+        logger.error(f"Error compressing video with ffmpeg: {e}")
+        return False
+
+
+def apply_id3_tags(mp3_file: str, title: str, artist: str, cover_path: Optional[str] = None):
+    """Embeds ID3 metadata and official album cover into MP3 file using mutagen."""
+    if not HAS_MUTAGEN or not os.path.exists(mp3_file):
+        return
+    try:
+        audio = ID3(mp3_file)
+    except Exception:
+        audio = ID3()
+
+    audio.add(TIT2(encoding=3, text=title))
+    audio.add(TPE1(encoding=3, text=artist))
+    audio.add(TALB(encoding=3, text=title))
+
+    if cover_path and os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
+        try:
+            with open(cover_path, 'rb') as f:
+                cover_data = f.read()
+            mime = 'image/png' if cover_path.lower().endswith('.png') else 'image/jpeg'
+            audio.add(APIC(
+                encoding=3,
+                mime=mime,
+                type=3,  # Front cover
+                desc='Cover',
+                data=cover_data
+            ))
+        except Exception as e_cover:
+            logger.warning(f"No se pudo incrustar la carátula en ID3: {e_cover}")
 
     try:
-        cmd = [
-            'ffmpeg', '-y', '-i', input_file,
-            '-c:v', 'libx264',
-            '-b:v', str(video_bitrate),
-            '-maxrate', str(int(video_bitrate * 1.3)),
-            '-bufsize', str(int(video_bitrate * 2)),
-            '-preset', 'veryfast',
-            '-c:a', 'aac',
-            '-b:a', '96k' if duration > 600 else '128k',
-            '-movflags', '+faststart',
-            output_file
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-        if res.returncode == 0 and os.path.exists(output_file):
-            if os.path.getsize(output_file) <= MAX_TELEGRAM_SIZE_BYTES:
-                return True
-    except Exception:
-        pass
-
-    return False
+        audio.save(mp3_file, v2_version=3)
+        logger.info(f"✅ Tags ID3 y carátula incrustados exitosamente en: {mp3_file}")
+    except Exception as e:
+        logger.warning(f"Error al guardar tags ID3 con mutagen: {e}")
 
 
-def download_tiktok_via_api(url: str, format_type: str, temp_subfolder: str) -> Dict[str, Any]:
-    """Downloads TikTok video or audio directly via TikWM API when yt-dlp is IP blocked."""
-    import urllib.parse
+# ==============================================================================
+# 1. TIKTOK FAST EXTRACTOR (100% Zero-Cookies via TikWM)
+# ==============================================================================
+def download_tiktok_fast(url: str, format_type: str, temp_subfolder: str) -> Dict[str, Any]:
+    """Downloads TikTok videos without watermark or photo slideshows directly via TikWM API."""
     api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}"
     headers = {
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/124.0.0.0 Safari/537.36'
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         )
     }
-    req = urllib.request.Request(api_url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
 
-    if data.get('code') != 0:
-        msg = data.get('msg', 'Error desconocido en TikTok API')
+    data = None
+    last_err = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                if data and data.get('code') == 0:
+                    break
+        except Exception as e:
+            last_err = e
+
+    if not data or data.get('code') != 0:
+        msg = data.get('msg') if data else str(last_err or "Error de conexión con TikWM")
         raise ValueError(f"No se pudo descargar el video de TikTok: {msg}")
 
     item = data.get('data', {})
@@ -234,24 +297,28 @@ def download_tiktok_via_api(url: str, format_type: str, temp_subfolder: str) -> 
     duration = item.get('duration') or 0
     cover_url = item.get('cover')
 
+    # Audio MP3 format
     if format_type == 'mp3':
         music_url = item.get('music') or item.get('play')
         if not music_url:
             raise ValueError("No se encontró el audio de este TikTok.")
         raw_audio = os.path.join(temp_subfolder, "tiktok_audio_raw")
         urllib.request.urlretrieve(music_url, raw_audio)
-        mp3_file = os.path.join(temp_subfolder, f"{item.get('id', 'tiktok_audio')}.mp3")
+        mp3_file = os.path.join(temp_subfolder, f"{item.get('id', 'tiktok')}.mp3")
         cmd = ['ffmpeg', '-y', '-i', raw_audio, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', mp3_file]
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         final_file = mp3_file if (os.path.exists(mp3_file) and os.path.getsize(mp3_file) > 0) else raw_audio
+
         thumb_file = None
         if cover_url:
             raw_cov = os.path.join(temp_subfolder, "tiktok_cover.jpg")
             try:
                 urllib.request.urlretrieve(cover_url, raw_cov)
                 thumb_file = convert_thumbnail_to_jpg(raw_cov, "", temp_subfolder)
+                apply_id3_tags(final_file, title, author, thumb_file)
             except Exception:
                 pass
+
         return {
             'type': 'audio',
             'file_path': final_file,
@@ -280,24 +347,8 @@ def download_tiktok_via_api(url: str, format_type: str, temp_subfolder: str) -> 
             except Exception:
                 pass
         if media_items:
-            if len(media_items) == 1:
-                return {
-                    'type': 'photo',
-                    'file_path': media_items[0]['file_path'],
-                    'thumbnail_path': None,
-                    'title': title,
-                    'artist': author,
-                    'duration': None,
-                    'width': None,
-                    'height': None,
-                    'filesize': media_items[0]['filesize'],
-                    'platform': 'TikTok',
-                    'platform_emoji': '🎵',
-                    'is_audio': False,
-                    'format': 'jpg',
-                }
             return {
-                'type': 'album',
+                'type': 'carousel',
                 'media_items': media_items,
                 'title': title,
                 'artist': author,
@@ -306,46 +357,36 @@ def download_tiktok_via_api(url: str, format_type: str, temp_subfolder: str) -> 
                 'platform': 'TikTok',
                 'platform_emoji': '🎵',
                 'is_audio': False,
-                'format': 'album',
+                'format': 'mp4',
             }
 
-    # Video MP4
-    play_url = item.get('play') or item.get('wmplay')
-    if not play_url:
-        raise ValueError("No se encontró el video de este TikTok.")
+    # TikTok Video (Watermark-free)
+    video_url = item.get('hdplay') or item.get('play')
+    if not video_url:
+        raise ValueError("No se pudo obtener el video de TikTok.")
 
-    dest_video = os.path.join(temp_subfolder, f"{item.get('id', 'tiktok_video')}.mp4")
-    urllib.request.urlretrieve(play_url, dest_video)
+    out_video = os.path.join(temp_subfolder, f"tiktok_{item.get('id', 'video')}.mp4")
+    urllib.request.urlretrieve(video_url, out_video)
 
     thumb_file = None
     if cover_url:
         raw_cov = os.path.join(temp_subfolder, "tiktok_cover.jpg")
         try:
             urllib.request.urlretrieve(cover_url, raw_cov)
-            thumb_file = convert_thumbnail_to_jpg(raw_cov, dest_video, temp_subfolder)
+            thumb_file = convert_thumbnail_to_jpg(raw_cov, out_video, temp_subfolder)
         except Exception:
             pass
 
-    if not thumb_file:
-        thumb_file = convert_thumbnail_to_jpg(None, dest_video, temp_subfolder)
-
-    file_size = os.path.getsize(dest_video)
-    if file_size > MAX_TELEGRAM_SIZE_BYTES and duration and 0 < duration < 1800:
-        compressed_path = os.path.join(temp_subfolder, 'compressed_video.mp4')
-        if compress_video_ffmpeg(dest_video, compressed_path, float(duration)):
-            dest_video = compressed_path
-            file_size = os.path.getsize(dest_video)
-
     return {
         'type': 'video',
-        'file_path': dest_video,
+        'file_path': out_video,
         'thumbnail_path': thumb_file,
         'title': title,
         'artist': author,
         'duration': int(duration) if duration else None,
         'width': None,
         'height': None,
-        'filesize': file_size,
+        'filesize': os.path.getsize(out_video),
         'platform': 'TikTok',
         'platform_emoji': '🎵',
         'is_audio': False,
@@ -353,8 +394,11 @@ def download_tiktok_via_api(url: str, format_type: str, temp_subfolder: str) -> 
     }
 
 
-def download_twitter_fallback(url: str, temp_subfolder: str, format_type: str = "mp4") -> Dict[str, Any]:
-    """Downloads Twitter/X video, photos, or mixed media using api.fxtwitter.com (bypasses 18+/NSFW auth)."""
+# ==============================================================================
+# 2. X.COM (TWITTER) FAST EXTRACTOR (100% Zero-Cookies via FxTwitter)
+# ==============================================================================
+def download_twitter_fast(url: str, temp_subfolder: str, format_type: str = "mp4") -> Dict[str, Any]:
+    """Downloads Twitter/X media using FxTwitter API directly (bypasses 18+/NSFW auth and cloud IP blocks)."""
     m = re.search(r'(?:twitter\.com|x\.com)/([a-zA-Z0-9_]+)/status/(\d+)', url)
     if not m:
         raise ValueError("URL de X (Twitter) no válida.")
@@ -396,15 +440,15 @@ def download_twitter_fallback(url: str, temp_subfolder: str, format_type: str = 
     if not media_all:
         raise ValueError("Este Tweet no contiene videos ni imágenes descargables.")
 
-    # If user specifically asked for MP3 audio
+    # MP3 Audio
     if format_type == 'mp3':
         video_items = [item for item in media_all if item.get('type') == 'video']
         if not video_items:
-            raise ValueError("Esta publicación de X solo contiene imágenes y no tiene audio.")
+            raise ValueError("Esta publicación de X no contiene video para extraer audio.")
         vid_item = video_items[0]
         vid_url = vid_item.get('url')
         if not vid_url:
-            raise ValueError("No se pudo obtener el enlace del video para extraer audio.")
+            raise ValueError("No se pudo obtener el enlace del video.")
 
         raw_vid = os.path.join(temp_subfolder, f"tw_{twid}_raw.mp4")
         urllib.request.urlretrieve(vid_url, raw_vid)
@@ -419,17 +463,17 @@ def download_twitter_fallback(url: str, temp_subfolder: str, format_type: str = 
             try:
                 urllib.request.urlretrieve(vid_item['thumbnail_url'], raw_thumb)
                 thumb_path = convert_thumbnail_to_jpg(raw_thumb, final_file, temp_subfolder)
+                apply_id3_tags(final_file, text, author, thumb_path)
             except Exception:
                 pass
 
-        duration = vid_item.get('duration') or 0
         return {
             'type': 'audio',
             'file_path': final_file,
             'thumbnail_path': thumb_path,
             'title': text,
             'artist': author,
-            'duration': int(duration) if duration else None,
+            'duration': int(vid_item.get('duration') or 0) or None,
             'width': None,
             'height': None,
             'filesize': os.path.getsize(final_file),
@@ -439,7 +483,7 @@ def download_twitter_fallback(url: str, temp_subfolder: str, format_type: str = 
             'format': 'mp3',
         }
 
-    # Normal video or photo download (format_type == 'mp4')
+    # Video or Photos
     downloaded_items = []
     for idx, item in enumerate(media_all[:10]):
         itype = item.get('type')
@@ -449,146 +493,195 @@ def download_twitter_fallback(url: str, temp_subfolder: str, format_type: str = 
         if itype == 'video':
             out_path = os.path.join(temp_subfolder, f"tw_{twid}_{idx}.mp4")
             urllib.request.urlretrieve(iurl, out_path)
-            thumb_path = None
+            t_path = None
             if item.get('thumbnail_url'):
-                raw_thumb = os.path.join(temp_subfolder, f"tw_thumb_{idx}.jpg")
+                raw_thumb = os.path.join(temp_subfolder, f"tw_thumb_{twid}_{idx}.jpg")
                 try:
                     urllib.request.urlretrieve(item['thumbnail_url'], raw_thumb)
-                    thumb_path = convert_thumbnail_to_jpg(raw_thumb, out_path, temp_subfolder)
+                    t_path = convert_thumbnail_to_jpg(raw_thumb, out_path, temp_subfolder)
                 except Exception:
                     pass
-            if not thumb_path:
-                thumb_path = convert_thumbnail_to_jpg(None, out_path, temp_subfolder)
-
-            file_size = os.path.getsize(out_path)
-            duration = item.get('duration') or 0
-            if file_size > MAX_TELEGRAM_SIZE_BYTES and duration and 0 < duration < 1800:
-                compressed = os.path.join(temp_subfolder, f"comp_{idx}.mp4")
-                if compress_video_ffmpeg(out_path, compressed, float(duration)):
-                    out_path = compressed
-                    file_size = os.path.getsize(out_path)
-
             downloaded_items.append({
                 'type': 'video',
                 'file_path': out_path,
-                'thumbnail_path': thumb_path,
-                'duration': int(duration) if duration else None,
-                'filesize': file_size,
+                'thumbnail_path': t_path,
+                'duration': int(item.get('duration') or 0) or None,
+                'width': item.get('width'),
+                'height': item.get('height'),
+                'filesize': os.path.getsize(out_path),
             })
-        else:
-            # Photo
+        elif itype == 'photo':
             out_path = os.path.join(temp_subfolder, f"tw_{twid}_{idx}.jpg")
             urllib.request.urlretrieve(iurl, out_path)
             downloaded_items.append({
                 'type': 'photo',
                 'file_path': out_path,
+                'thumbnail_path': None,
+                'duration': None,
+                'width': item.get('width'),
+                'height': item.get('height'),
                 'filesize': os.path.getsize(out_path),
             })
 
     if not downloaded_items:
-        raise ValueError("No se pudo descargar la multimedia de este Tweet.")
+        raise ValueError("No se pudo descargar ningún medio del Tweet.")
 
     if len(downloaded_items) == 1:
-        first = downloaded_items[0]
-        return {
-            'type': first['type'],
-            'file_path': first['file_path'],
-            'thumbnail_path': first.get('thumbnail_path'),
-            'title': text,
-            'artist': author,
-            'duration': first.get('duration'),
-            'width': None,
-            'height': None,
-            'filesize': first['filesize'],
-            'platform': 'X (Twitter)',
-            'platform_emoji': '🐦',
-            'is_audio': False,
-            'format': 'mp4' if first['type'] == 'video' else 'jpg',
-        }
+        single = downloaded_items[0]
+        single['title'] = text
+        single['artist'] = author
+        single['platform'] = 'X (Twitter)'
+        single['platform_emoji'] = '🐦'
+        single['is_audio'] = False
+        single['format'] = 'mp4'
+        return single
 
     return {
-        'type': 'album',
+        'type': 'carousel',
         'media_items': downloaded_items,
         'title': text,
         'artist': author,
         'duration': None,
-        'filesize': sum(m['filesize'] for m in downloaded_items),
+        'filesize': sum(i['filesize'] for i in downloaded_items),
         'platform': 'X (Twitter)',
         'platform_emoji': '🐦',
         'is_audio': False,
-        'format': 'album',
+        'format': 'mp4',
     }
 
 
-def download_instagram_direct(
-    url: str,
-    temp_subfolder: str,
-    cookies_file: Optional[str] = None,
-    format_type: str = "mp4"
-) -> Dict[str, Any]:
-    """Downloads Instagram video, photo, or carousel directly via mobile API (supports +18/age-restricted and photos)."""
-    from yt_dlp.utils import traverse_obj
-    ydl = yt_dlp.YoutubeDL({'cookiefile': cookies_file, 'quiet': True})
-    ie = ydl.get_info_extractor('Instagram')
-    ie.initialize()
-    video_id, _ = ie._match_valid_url(url).group('id', 'url')
-    media_id = str(yt_dlp.extractor.instagram._id_to_pk(video_id))
-    api_url = f'{ie._API_BASE_URL}/media/{media_id}/info/'
-    data = None
-    try:
-        data = ie._download_json(api_url, video_id, headers=ie._api_headers, impersonate=True)
-    except Exception as e_info:
-        logger.warning(f"Instagram mobile API info falló ({e_info}), intentando consulta GraphQL...")
-        try:
-            gql_res = ie._download_json(
-                'https://www.instagram.com/api/graphql', video_id,
-                fatal=False, impersonate=True,
-                headers={
-                    **ie._api_headers,
-                    'X-FB-Friendly-Name': 'PolarisLoggedOutDesktopWWWPostRootContentQuery',
-                    'X-FB-LSD': getattr(ie, '_lsd_token', None),
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Referer': f'https://www.instagram.com/p/{video_id}/',
-                },
-                data=yt_dlp.utils.urlencode_postdata({
-                    'lsd': getattr(ie, '_lsd_token', None),
-                    'fb_api_caller_class': 'RelayModern',
-                    'fb_api_req_friendly_name': 'PolarisLoggedOutDesktopWWWPostRootContentQuery',
-                    'server_timestamps': 'true',
-                    'variables': json.dumps({'media_id': media_id}, separators=(',', ':')),
-                    'doc_id': '27130156389949648',
-                })
-            )
-            if gql_res:
-                product = traverse_obj(gql_res, ('data', 'xig_polaris_media', 'if_not_gated_logged_out'))
-                if product:
-                    data = {'items': [product]}
-        except Exception:
-            pass
+# ==============================================================================
+# 3. INSTAGRAM ZERO-COOKIES EXTRACTOR (Polaris GraphQL + curl_cffi TLS + Bridge)
+# ==============================================================================
+def download_instagram_zero_cookies(url: str, temp_subfolder: str, format_type: str = "mp4") -> Dict[str, Any]:
+    """
+    Downloads Instagram media without requiring any cookies or session ID.
+    Uses browser TLS impersonation (Chrome 124) to query Polaris web GraphQL or public bridge.
+    """
+    shortcode = extract_instagram_shortcode(url)
+    if not shortcode:
+        raise ValueError("URL de Instagram no válida.")
 
-    if not data or not data.get('items'):
+    # Convert shortcode to media_id
+    ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+    media_id = 0
+    for char in shortcode:
+        if char in ALPHABET:
+            media_id = media_id * 64 + ALPHABET.index(char)
+    media_id_str = str(media_id)
+
+    media_data = None
+    caption = "Instagram Post"
+    author = "Instagram"
+
+    # Layer 1: Polaris Logged-Out Web GraphQL with curl_cffi
+    if HAS_CURL_CFFI:
+        try:
+            session = cffi_requests.Session(impersonate="chrome124")
+            # Step 1: visit homepage to get fresh anonymous csrftoken & datr
+            home_resp = session.get("https://www.instagram.com/", timeout=10)
+            csrf_token = session.cookies.get("csrftoken", "")
+
+            # Extract LSD token
+            lsd_match = re.search(r'\"LSD\",\[\],\{\"token\":\"([^\"]+)\"\}', home_resp.text)
+            lsd_token = lsd_match.group(1) if lsd_match else "AVr"
+
+            headers = {
+                'X-IG-App-ID': '936619743392459',
+                'X-FB-Friendly-Name': 'PolarisLoggedOutDesktopWWWPostRootContentQuery',
+                'X-CSRFToken': csrf_token,
+                'X-FB-LSD': lsd_token,
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': f'https://www.instagram.com/reel/{shortcode}/',
+            }
+
+            payload = {
+                'lsd': lsd_token,
+                'fb_api_caller_class': 'RelayModern',
+                'fb_api_req_friendly_name': 'PolarisLoggedOutDesktopWWWPostRootContentQuery',
+                'server_timestamps': 'true',
+                'variables': json.dumps({'media_id': media_id_str}, separators=(',', ':')),
+                'doc_id': '27130156389949648',
+            }
+
+            gql_resp = session.post(
+                "https://www.instagram.com/api/graphql",
+                headers=headers,
+                data=payload,
+                timeout=15
+            )
+
+            if gql_resp.status_code == 200:
+                gql_json = gql_resp.json()
+                product = (
+                    (gql_json.get('data') or {})
+                    .get('xig_polaris_media', {})
+                    .get('if_not_gated_logged_out')
+                )
+                if product:
+                    media_data = product
+                    caption = (product.get('caption') or {}).get('text') or caption
+                    author = (product.get('user') or {}).get('username') or author
+                    logger.info(f"✅ Instagram extraído exitosamente vía Polaris GraphQL (0 Cookies).")
+        except Exception as e_polaris:
+            logger.warning(f"Intento Polaris GraphQL falló: {e_polaris}")
+
+    # Layer 2: Cobalt Public Bridge
+    if not media_data:
+        for instance in COBALT_INSTANCES:
+            try:
+                c_req = urllib.request.Request(
+                    instance,
+                    data=json.dumps({"url": f"https://www.instagram.com/reel/{shortcode}/"}).encode(),
+                    headers={
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json',
+                        'User-Agent': 'Mozilla/5.0'
+                    }
+                )
+                with urllib.request.urlopen(c_req, timeout=12) as c_resp:
+                    c_data = json.loads(c_resp.read().decode())
+                    if c_data.get('status') in ['redirect', 'tunnel'] and c_data.get('url'):
+                        c_url = c_data['url']
+                        out_vid = os.path.join(temp_subfolder, f"ig_{shortcode}.mp4")
+                        urllib.request.urlretrieve(c_url, out_vid)
+                        thumb_file = convert_thumbnail_to_jpg(None, out_vid, temp_subfolder)
+                        return {
+                            'type': 'video',
+                            'file_path': out_vid,
+                            'thumbnail_path': thumb_file,
+                            'title': "Reel de Instagram",
+                            'artist': "Instagram",
+                            'duration': None,
+                            'width': None,
+                            'height': None,
+                            'filesize': os.path.getsize(out_vid),
+                            'platform': 'Instagram',
+                            'platform_emoji': '📸',
+                            'is_audio': False,
+                            'format': 'mp4',
+                        }
+            except Exception:
+                continue
+
+    if not media_data:
         raise ValueError(
-            "🔒 Contenido con Restricción de Edad o Audiencia en Instagram.\n\n"
-            "Instagram bloquea el acceso anónimo a esta publicación (contenido clasificado como videojuegos, edad mínima de cuenta o audiencia restringida).\n\n"
-            "💡 Para descargar videos o fotos con restricción: Añade tu sesión de Instagram en tu archivo .env o en las variables de entorno de tu hosting:\n"
-            "INSTAGRAM_SESSIONID=tu_session_id\n\n"
-            "(Obtén el valor de la cookie 'sessionid' desde instagram.com en tu navegador -> F12 -> Almacenamiento/Storage -> Cookies)"
+            "No se pudo extraer la publicación de Instagram de forma anónima.\n"
+            "Verifica que el enlace sea público."
         )
 
-    item = data['items'][0]
-    caption = traverse_obj(item, ('caption', 'text')) or "Publicación de Instagram"
-    author = traverse_obj(item, ('user', 'username')) or "Instagram"
-    media_type = item.get('media_type')  # 1: Photo, 2: Video, 8: Carousel
+    # Process extracted media_data
+    media_type = media_data.get('media_type')  # 1: Photo, 2: Video, 8: Carousel
 
-    # If user requested MP3 audio
+    # MP3 Format
     if format_type == 'mp3':
         vid_url = None
         if media_type == 2:
-            video_versions = item.get('video_versions') or []
+            video_versions = media_data.get('video_versions') or []
             if video_versions:
                 vid_url = video_versions[0].get('url')
         elif media_type == 8:
-            carousel = item.get('carousel_media') or []
+            carousel = media_data.get('carousel_media') or []
             for sub in carousel:
                 if sub.get('media_type') == 2:
                     vids = sub.get('video_versions') or []
@@ -597,33 +690,33 @@ def download_instagram_direct(
                         break
 
         if not vid_url:
-            raise ValueError("Esta publicación de Instagram solo contiene fotos y no tiene audio.")
+            raise ValueError("Esta publicación de Instagram no contiene video para extraer audio.")
 
-        raw_vid = os.path.join(temp_subfolder, f"ig_{video_id}_raw.mp4")
+        raw_vid = os.path.join(temp_subfolder, f"ig_{shortcode}_raw.mp4")
         urllib.request.urlretrieve(vid_url, raw_vid)
-        mp3_file = os.path.join(temp_subfolder, f"ig_{video_id}.mp3")
+        mp3_file = os.path.join(temp_subfolder, f"ig_{shortcode}.mp3")
         cmd = ['ffmpeg', '-y', '-i', raw_vid, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', mp3_file]
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         final_file = mp3_file if (os.path.exists(mp3_file) and os.path.getsize(mp3_file) > 0) else raw_vid
 
-        candidates = traverse_obj(item, ('image_versions2', 'candidates')) or []
         thumb_path = None
+        candidates = (media_data.get('image_versions2') or {}).get('candidates') or []
         if candidates:
             raw_thumb = os.path.join(temp_subfolder, "ig_thumb.jpg")
             try:
                 urllib.request.urlretrieve(candidates[0]['url'], raw_thumb)
                 thumb_path = convert_thumbnail_to_jpg(raw_thumb, final_file, temp_subfolder)
+                apply_id3_tags(final_file, caption, author, thumb_path)
             except Exception:
                 pass
 
-        duration = item.get('video_duration', 0) or 0
         return {
             'type': 'audio',
             'file_path': final_file,
             'thumbnail_path': thumb_path,
             'title': caption,
             'artist': author,
-            'duration': int(duration) if duration else None,
+            'duration': int(media_data.get('video_duration', 0) or 0) or None,
             'width': None,
             'height': None,
             'filesize': os.path.getsize(final_file),
@@ -633,14 +726,13 @@ def download_instagram_direct(
             'format': 'mp3',
         }
 
-    # 1. Single photo
+    # Single Photo
     if media_type == 1:
-        candidates = traverse_obj(item, ('image_versions2', 'candidates')) or []
+        candidates = (media_data.get('image_versions2') or {}).get('candidates') or []
         if not candidates:
-            raise ValueError("No se encontró la imagen de esta publicación de Instagram.")
-        img_url = candidates[0]['url']
-        out_photo = os.path.join(temp_subfolder, f"ig_{video_id}.jpg")
-        urllib.request.urlretrieve(img_url, out_photo)
+            raise ValueError("No se encontró la imagen de este post de Instagram.")
+        out_photo = os.path.join(temp_subfolder, f"ig_{shortcode}.jpg")
+        urllib.request.urlretrieve(candidates[0]['url'], out_photo)
         return {
             'type': 'photo',
             'file_path': out_photo,
@@ -654,366 +746,178 @@ def download_instagram_direct(
             'platform': 'Instagram',
             'platform_emoji': '📸',
             'is_audio': False,
-            'format': 'jpg',
+            'format': 'mp4',
         }
 
-    # 2. Single video
+    # Single Video / Reel
     if media_type == 2:
-        video_versions = item.get('video_versions') or []
+        video_versions = media_data.get('video_versions') or []
         if not video_versions:
-            raise ValueError("No se encontró el video de este Reel/Post de Instagram.")
-        vid_url = video_versions[0]['url']
-        out_video = os.path.join(temp_subfolder, f"ig_{video_id}.mp4")
-        urllib.request.urlretrieve(vid_url, out_video)
-        duration = item.get('video_duration', 0) or 0
-        file_size = os.path.getsize(out_video)
+            raise ValueError("No se encontró el archivo de video en este Reel.")
+        out_vid = os.path.join(temp_subfolder, f"ig_{shortcode}.mp4")
+        urllib.request.urlretrieve(video_versions[0]['url'], out_vid)
 
-        if file_size > MAX_TELEGRAM_SIZE_BYTES and duration and 0 < duration < 1800:
-            compressed = os.path.join(temp_subfolder, f"comp_ig_{video_id}.mp4")
-            if compress_video_ffmpeg(out_video, compressed, float(duration)):
-                out_video = compressed
-                file_size = os.path.getsize(out_video)
-
-        candidates = traverse_obj(item, ('image_versions2', 'candidates')) or []
         thumb_path = None
+        candidates = (media_data.get('image_versions2') or {}).get('candidates') or []
         if candidates:
             raw_thumb = os.path.join(temp_subfolder, "ig_thumb.jpg")
             try:
                 urllib.request.urlretrieve(candidates[0]['url'], raw_thumb)
-                thumb_path = convert_thumbnail_to_jpg(raw_thumb, out_video, temp_subfolder)
+                thumb_path = convert_thumbnail_to_jpg(raw_thumb, out_vid, temp_subfolder)
             except Exception:
                 pass
-        if not thumb_path:
-            thumb_path = convert_thumbnail_to_jpg(None, out_video, temp_subfolder)
 
         return {
             'type': 'video',
-            'file_path': out_video,
+            'file_path': out_vid,
             'thumbnail_path': thumb_path,
             'title': caption,
             'artist': author,
-            'duration': int(duration) if duration else None,
+            'duration': int(media_data.get('video_duration', 0) or 0) or None,
             'width': video_versions[0].get('width'),
             'height': video_versions[0].get('height'),
-            'filesize': file_size,
+            'filesize': os.path.getsize(out_vid),
             'platform': 'Instagram',
             'platform_emoji': '📸',
             'is_audio': False,
             'format': 'mp4',
         }
 
-    # 3. Carousel (Album)
+    # Carousel (multiple photos / videos)
     if media_type == 8:
-        carousel = item.get('carousel_media') or []
+        carousel = media_data.get('carousel_media') or []
         downloaded = []
         for idx, sub in enumerate(carousel[:10]):
             sub_type = sub.get('media_type')
-            if sub_type == 1:
-                cands = traverse_obj(sub, ('image_versions2', 'candidates')) or []
-                if cands:
-                    p_path = os.path.join(temp_subfolder, f"ig_slide_{idx}.jpg")
-                    urllib.request.urlretrieve(cands[0]['url'], p_path)
-                    downloaded.append({
-                        'type': 'photo',
-                        'file_path': p_path,
-                        'filesize': os.path.getsize(p_path)
-                    })
-            elif sub_type == 2:
+            if sub_type == 2:
                 vids = sub.get('video_versions') or []
                 if vids:
-                    v_path = os.path.join(temp_subfolder, f"ig_slide_{idx}.mp4")
-                    urllib.request.urlretrieve(vids[0]['url'], v_path)
-                    dur = sub.get('video_duration', 0) or 0
-                    fsize = os.path.getsize(v_path)
-                    if fsize > MAX_TELEGRAM_SIZE_BYTES and dur and 0 < dur < 1800:
-                        comp = os.path.join(temp_subfolder, f"comp_slide_{idx}.mp4")
-                        if compress_video_ffmpeg(v_path, comp, float(dur)):
-                            v_path = comp
-                            fsize = os.path.getsize(v_path)
+                    out_path = os.path.join(temp_subfolder, f"ig_{shortcode}_{idx}.mp4")
+                    urllib.request.urlretrieve(vids[0]['url'], out_path)
+                    t_cand = (sub.get('image_versions2') or {}).get('candidates') or []
                     t_path = None
-                    cands = traverse_obj(sub, ('image_versions2', 'candidates')) or []
-                    if cands:
-                        raw_t = os.path.join(temp_subfolder, f"ig_thumb_{idx}.jpg")
+                    if t_cand:
+                        raw_t = os.path.join(temp_subfolder, f"ig_thumb_{shortcode}_{idx}.jpg")
                         try:
-                            urllib.request.urlretrieve(cands[0]['url'], raw_t)
-                            t_path = convert_thumbnail_to_jpg(raw_t, v_path, temp_subfolder)
+                            urllib.request.urlretrieve(t_cand[0]['url'], raw_t)
+                            t_path = convert_thumbnail_to_jpg(raw_t, out_path, temp_subfolder)
                         except Exception:
                             pass
                     downloaded.append({
                         'type': 'video',
-                        'file_path': v_path,
+                        'file_path': out_path,
                         'thumbnail_path': t_path,
-                        'duration': int(dur) if dur else None,
-                        'filesize': fsize
+                        'duration': int(sub.get('video_duration', 0) or 0) or None,
+                        'width': vids[0].get('width'),
+                        'height': vids[0].get('height'),
+                        'filesize': os.path.getsize(out_path),
+                    })
+            elif sub_type == 1:
+                imgs = (sub.get('image_versions2') or {}).get('candidates') or []
+                if imgs:
+                    out_path = os.path.join(temp_subfolder, f"ig_{shortcode}_{idx}.jpg")
+                    urllib.request.urlretrieve(imgs[0]['url'], out_path)
+                    downloaded.append({
+                        'type': 'photo',
+                        'file_path': out_path,
+                        'thumbnail_path': None,
+                        'duration': None,
+                        'width': imgs[0].get('width'),
+                        'height': imgs[0].get('height'),
+                        'filesize': os.path.getsize(out_path),
                     })
 
-        if downloaded:
-            if len(downloaded) == 1:
-                first = downloaded[0]
-                return {
-                    'type': first['type'],
-                    'file_path': first['file_path'],
-                    'thumbnail_path': first.get('thumbnail_path'),
-                    'title': caption,
-                    'artist': author,
-                    'duration': first.get('duration'),
-                    'filesize': first['filesize'],
-                    'platform': 'Instagram',
-                    'platform_emoji': '📸',
-                    'is_audio': False,
-                    'format': 'mp4' if first['type'] == 'video' else 'jpg',
-                }
-            return {
-                'type': 'album',
-                'media_items': downloaded,
-                'title': caption,
-                'artist': author,
-                'filesize': sum(m['filesize'] for m in downloaded),
-                'platform': 'Instagram',
-                'platform_emoji': '📸',
-                'is_audio': False,
-                'format': 'album',
-            }
+        if not downloaded:
+            raise ValueError("No se pudieron descargar los elementos del carrusel.")
 
-    raise ValueError("Formato de contenido de Instagram no reconocido.")
-
-
-def normalize_instagram_url(url: str) -> str:
-    """
-    Normalizes Instagram URLs to clean, standard formats recognized by extractors.
-    Handles /share/reel/ID, /share/p/ID, /share/ID, query parameter stripping, etc.
-    """
-    if not url:
-        return url
-
-    try:
-        parsed = urlparse(url)
-        path = parsed.path.rstrip('/')
-
-        # 1. Convert share URLs: /share/reel/XYZ -> /reel/XYZ/ or /share/p/XYZ -> /p/XYZ/
-        share_match = re.search(r'/share/(?:reel|p)/([a-zA-Z0-9_-]+)', path)
-        if share_match:
-            shortcode = share_match.group(1)
-            path = f"/reel/{shortcode}"
-        elif path.startswith('/share/'):
-            # Generic /share/ID or shortlink redirect
-            try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    redirected = resp.geturl()
-                    if redirected and redirected != url and 'instagram.com' in redirected:
-                        return normalize_instagram_url(redirected)
-            except Exception:
-                pass
-
-        # 2. Convert /reels/ to /reel/
-        if path.startswith('/reels/'):
-            path = '/reel/' + path[7:]
-
-        # 3. Strip tracking and share parameters (?igsh=..., ?stkn=..., utm_*, etc.)
-        qs = parse_qs(parsed.query)
-        filtered_qs = {
-            k: v for k, v in qs.items()
-            if not (k.startswith('utm_') or k in ['igsh', 'ig_mid', 'src', 'fbclid', 'ig_rid', 'stkn'])
+        return {
+            'type': 'carousel',
+            'media_items': downloaded,
+            'title': caption,
+            'artist': author,
+            'duration': None,
+            'filesize': sum(i['filesize'] for i in downloaded),
+            'platform': 'Instagram',
+            'platform_emoji': '📸',
+            'is_audio': False,
+            'format': 'mp4',
         }
-        from urllib.parse import urlencode
-        clean_query = urlencode(filtered_qs, doseq=True) if filtered_qs else ""
 
-        netloc = 'www.instagram.com' if any(d in parsed.netloc.lower() for d in ['instagr.am', 'instagram.com', 'ig.me']) else parsed.netloc
-        normalized = f"{parsed.scheme or 'https'}://{netloc}{path}/"
-        if clean_query:
-            normalized += f"?{clean_query}"
-        return normalized
-    except Exception:
-        return url
+    raise ValueError("Formato multimedia de Instagram no soportado.")
 
 
-def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
-    """
-    Sets up cookies from environment variables if present, merges them with existing file,
-    or automatically exports relevant cookies from installed local browsers (Firefox, Chrome, etc.).
-    Supports COOKIES_CONTENT, YOUTUBE_COOKIES, INSTAGRAM_COOKIES, and INSTAGRAM_SESSIONID.
-    """
-    ig_sessionid = (
-        os.getenv("INSTAGRAM_SESSIONID")
-        or os.getenv("INSTAGRAM_SESSION_ID")
-        or os.getenv("IG_SESSIONID")
-        or os.getenv("IG_SESSION_ID")
-        or os.getenv("INSTAGRAM_SESSION")
-        or os.getenv("IG_SESSION")
-        or os.getenv("SESSIONID")
-        or os.getenv("sessionid")
-        or os.getenv("instagram_sessionid")
-        or os.getenv("instagram_session_id")
-        or os.getenv("ig_sessionid")
-    )
-    env_sources = [
-        os.getenv("COOKIES_CONTENT"),
-        os.getenv("YOUTUBE_COOKIES"),
-        os.getenv("INSTAGRAM_COOKIES"),
-    ]
+# ==============================================================================
+# 4. YOUTUBE ZERO-COOKIES & BRIDGE EXTRACTOR
+# ==============================================================================
+def download_youtube_bridge(url: str, format_type: str, temp_subfolder: str) -> Optional[Dict[str, Any]]:
+    """Attempts to download YouTube audio/video via public bridge API to prevent Render IP blocks."""
+    yt_id = extract_youtube_id(url)
+    if not yt_id:
+        return None
 
-    proj_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        cookies_path if os.path.isabs(cookies_path) else os.path.join(proj_dir, cookies_path),
-        os.path.join(tempfile.gettempdir(), os.path.basename(cookies_path)),
-    ]
-
-    existing_lines = []
-    found_existing = False
-    chosen_path = candidates[0]
-
-    for cand in candidates:
-        if os.path.exists(cand) and os.path.getsize(cand) > 0:
-            try:
-                with open(cand, "r", encoding="utf-8", errors="ignore") as f:
-                    existing_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-                found_existing = True
-                chosen_path = cand
-                break
-            except Exception:
-                continue
-
-    new_lines = []
-    for src in env_sources:
-        if src and src.strip():
-            for line in src.strip().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    new_lines.append(line)
-
-    if ig_sessionid and ig_sessionid.strip():
-        sid = ig_sessionid.strip().strip('"').strip("'").strip()
-        if "sessionid=" in sid:
-            sid = sid.split("sessionid=")[1].split(";")[0].strip()
-        user_id = sid.split('%3A')[0].split(':')[0]
-        if user_id.isdigit():
-            new_lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tds_user_id\t{user_id}")
-        new_lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sid}")
-
-    if new_lines:
-        cookies_dict = {}
-        for l in existing_lines + new_lines:
-            parts = l.split('\t')
-            if len(parts) >= 7:
-                domain, name = parts[0], parts[5]
-                cookies_dict[(domain, name)] = l
-            else:
-                cookies_dict[l] = l
-
-        for cand in candidates:
-            try:
-                with open(cand, "w", encoding="utf-8") as f:
-                    f.write("# Netscape HTTP Cookie File\n")
-                    for c_line in cookies_dict.values():
-                        f.write(c_line + "\n")
-                return cand
-            except Exception as e:
-                logger.warning(f"Error escribiendo archivo de cookies en {cand}: {e}")
-
-    if found_existing:
-        return chosen_path
-
-    # Try automatic extraction from local browsers
-    for browser in ['firefox', 'chrome', 'brave', 'chromium', 'edge']:
+    for instance in COBALT_INSTANCES:
         try:
-            ydl_test = yt_dlp.YoutubeDL({'cookiesfrombrowser': (browser, None, None, None), 'quiet': True})
-            if ydl_test.cookiejar and len(ydl_test.cookiejar) > 0:
-                with open(cookies_path, "w", encoding="utf-8") as f:
-                    f.write("# Netscape HTTP Cookie File\n")
-                    for c in ydl_test.cookiejar:
-                        if any(d in c.domain for d in ['youtube.com', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'facebook.com', 'spotify.com']):
-                            initial_dot = "TRUE" if c.domain.startswith(".") else "FALSE"
-                            secure = "TRUE" if c.secure else "FALSE"
-                            expires = str(c.expires) if c.expires else "0"
-                            f.write(f"{c.domain}\t{initial_dot}\t{c.path}\t{secure}\t{expires}\t{c.name}\t{c.value}\n")
-                if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-                    logger.info(f"Cookies exportadas exitosamente desde {browser} a {cookies_path}")
-                    return cookies_path
-        except Exception:
+            payload = {
+                "url": f"https://www.youtube.com/watch?v={yt_id}",
+                "downloadMode": "audio" if format_type == "mp3" else "auto",
+                "audioFormat": "mp3" if format_type == "mp3" else "best",
+            }
+            req = urllib.request.Request(
+                instance,
+                data=json.dumps(payload).encode(),
+                headers={
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0'
+                }
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+                if data.get('status') in ['redirect', 'tunnel'] and data.get('url'):
+                    stream_url = data['url']
+                    ext = "mp3" if format_type == "mp3" else "mp4"
+                    out_file = os.path.join(temp_subfolder, f"yt_{yt_id}.{ext}")
+                    urllib.request.urlretrieve(stream_url, out_file)
+                    thumb_path = None
+                    if ext == "mp4":
+                        thumb_path = convert_thumbnail_to_jpg(None, out_file, temp_subfolder)
+                    logger.info(f"✅ Descarga de YouTube completada exitosamente vía Bridge ({instance})")
+                    return {
+                        'type': 'audio' if format_type == 'mp3' else 'video',
+                        'file_path': out_file,
+                        'thumbnail_path': thumb_path,
+                        'title': f"YouTube Video {yt_id}",
+                        'artist': "YouTube",
+                        'duration': None,
+                        'width': None,
+                        'height': None,
+                        'filesize': os.path.getsize(out_file),
+                        'platform': 'YouTube',
+                        'platform_emoji': '▶️',
+                        'is_audio': (format_type == 'mp3'),
+                        'format': format_type,
+                    }
+        except Exception as e:
+            logger.debug(f"Bridge attempt on {instance} failed: {e}")
             continue
 
     return None
 
 
-def get_js_runtimes_config() -> Optional[Dict[str, Any]]:
-    """Detects available JS runtime (node/deno/bun) for yt-dlp challenge solving."""
-    node_path = shutil.which("node") or shutil.which("nodejs")
-    if not node_path:
-        nvm_patterns = [
-            os.path.expanduser("~/.nvm/versions/node/*/bin/node"),
-            "/var/home/*/.nvm/versions/node/*/bin/node",
-            "/home/*/.nvm/versions/node/*/bin/node",
-            "/usr/local/bin/node",
-            "/usr/bin/node",
-            "/usr/bin/nodejs",
-            os.path.expanduser("~/.local/bin/node"),
-        ]
-        for pattern in nvm_patterns:
-            matches = glob.glob(pattern)
-            if matches:
-                matches.sort()
-                found = matches[-1]
-                if os.path.isfile(found) and os.access(found, os.X_OK):
-                    node_path = found
-                    break
-
-    if node_path:
-        return {'node': {'path': node_path}}
-
-    deno_path = shutil.which("deno")
-    if not deno_path:
-        for p in [
-            os.path.expanduser("~/.deno/bin/deno"),
-            "/var/home/*/.deno/bin/deno",
-            "/home/*/.deno/bin/deno",
-            "/usr/local/bin/deno",
-            "/usr/bin/deno",
-        ]:
-            matches = glob.glob(p) if '*' in p else ([p] if os.path.exists(p) else [])
-            for cand in matches:
-                if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                    deno_path = cand
-                    break
-            if deno_path:
-                break
-    if deno_path:
-        return {'deno': {'path': deno_path}}
-
-    bun_path = shutil.which("bun")
-    if not bun_path:
-        for p in [
-            os.path.expanduser("~/.bun/bin/bun"),
-            "/var/home/*/.bun/bin/bun",
-            "/home/*/.bun/bin/bun",
-            "/usr/local/bin/bun",
-            "/usr/bin/bun",
-        ]:
-            matches = glob.glob(p) if '*' in p else ([p] if os.path.exists(p) else [])
-            for cand in matches:
-                if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                    bun_path = cand
-                    break
-            if bun_path:
-                break
-    if bun_path:
-        return {'bun': {'path': bun_path}}
-
-    return None
-
-
+# ==============================================================================
+# MAIN VIDEODOWNLOADER CLASS
+# ==============================================================================
 class VideoDownloader:
     def __init__(self, temp_dir: Optional[str] = None, cookies_file: Optional[str] = None):
         self.temp_dir = temp_dir or tempfile.gettempdir()
-        self.cookies_path_setting = cookies_file or "cookies.txt"
-        self.cookies_file = setup_cookies_file(self.cookies_path_setting)
+        self.cookies_file = cookies_file
 
     def _sync_download_spotify(self, url: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
-        """Downloads high quality audio matching a Spotify track using SoundCloud (primary) or YouTube (fallback)."""
+        """Downloads high quality audio matching a Spotify track using SoundCloud (primary) or YouTube Bridge."""
         meta = get_spotify_info(url)
         title = meta['title']
         artist = meta['artist']
-        search_query = f"{artist} {title}" if artist and artist != 'Artista Desconocido' else title
+        search_query = f"{artist} {title}" if artist and artist != 'Artista' else title
 
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -1029,39 +933,32 @@ class VideoDownloader:
             'max_filesize': MAX_TELEGRAM_SIZE_BYTES,
         }
 
-        if self.cookies_file:
-            ydl_opts['cookiefile'] = self.cookies_file
-
         info = None
         ydl_used = None
 
-        # 1. Try SoundCloud first (reliable, 0 IP blocks on cloud datacenter IPs)
+        # 1. Primary: SoundCloud search (0 IP blocks on cloud servers!)
         try:
             ydl_sc = yt_dlp.YoutubeDL(ydl_opts)
             sc_info = ydl_sc.extract_info(f"scsearch1:{search_query}", download=True)
             if sc_info and 'entries' in sc_info and sc_info['entries']:
                 info = sc_info
                 ydl_used = ydl_sc
+                logger.info(f"✅ Audio de Spotify localizado en SoundCloud: '{search_query}'")
         except Exception as e:
-            logger.info(f"SoundCloud search for '{search_query}' failed: {e}")
+            logger.info(f"Búsqueda SoundCloud falló: {e}")
 
-        # 2. Fallback to YouTube if SoundCloud didn't find the track
+        # 2. Fallback: YouTube Search with rotating clients
         if not info or not info.get('entries'):
             try:
-                yt_query = f"{artist} - {title} audio" if artist else f"{title} audio"
                 yt_opts = dict(ydl_opts)
-                yt_opts.pop('cookiefile', None)
-                js_cfg = get_js_runtimes_config()
-                if js_cfg:
-                    yt_opts['js_runtimes'] = js_cfg
-                yt_opts['extractor_args'] = {'youtube': {'player_client': ['visionos']}}
+                yt_opts['extractor_args'] = {'youtube': {'player_client': ['visionos', 'android_vr']}}
                 ydl_yt = yt_dlp.YoutubeDL(yt_opts)
-                yt_info = ydl_yt.extract_info(f"ytsearch1:{yt_query}", download=True)
+                yt_info = ydl_yt.extract_info(f"ytsearch1:{artist} - {title} audio", download=True)
                 if yt_info and 'entries' in yt_info and yt_info['entries']:
                     info = yt_info
                     ydl_used = ydl_yt
             except Exception as e2:
-                logger.warning(f"YouTube fallback for '{search_query}' failed: {e2}")
+                logger.warning(f"Fallback YouTube falló: {e2}")
 
         if not info or not info.get('entries'):
             raise ValueError(f"No se encontró el audio para '{artist} - {title}'.")
@@ -1079,27 +976,26 @@ class VideoDownloader:
         if not mp3_file or not os.path.exists(mp3_file):
             raise FileNotFoundError("No se encontró el archivo MP3 descargado.")
 
-        file_size = os.path.getsize(mp3_file)
-        duration = entry.get('duration') or 0
-
-        # Download album cover
+        # Download official Spotify cover art and embed into MP3 with mutagen
         thumb_file = None
         if meta.get('thumbnail_url'):
             thumb_file = os.path.join(temp_subfolder, 'spotify_cover.jpg')
             try:
                 urllib.request.urlretrieve(meta['thumbnail_url'], thumb_file)
+                apply_id3_tags(mp3_file, title, artist, thumb_file)
             except Exception:
                 thumb_file = None
 
         return {
+            'type': 'audio',
             'file_path': mp3_file,
             'thumbnail_path': thumb_file,
             'title': title,
             'artist': artist,
-            'duration': int(duration) if duration else None,
+            'duration': int(entry.get('duration') or 0) or None,
             'width': None,
             'height': None,
-            'filesize': file_size,
+            'filesize': os.path.getsize(mp3_file),
             'platform': 'Spotify',
             'platform_emoji': '🟢',
             'is_audio': True,
@@ -1107,34 +1003,46 @@ class VideoDownloader:
         }
 
     def _sync_download(self, url: str, format_type: str, output_template: str, temp_subfolder: str) -> Dict[str, Any]:
-        """
-        Synchronous download execution using yt-dlp.
-        Supports YouTube (MP3/MP4), TikTok, Instagram, X (Twitter), Facebook, etc.
-        """
-        # Ensure fresh cookies from environment are loaded
-        self.cookies_file = setup_cookies_file(getattr(self, 'cookies_path_setting', 'cookies.txt'))
-
-        if is_spotify_url(url):
-            return self._sync_download_spotify(url, output_template, temp_subfolder)
-
+        """Synchronous dispatcher for all platforms with Zero-Cookies priority."""
         format_type = format_type.lower().strip()
         if format_type not in ['mp3', 'mp4']:
             format_type = 'mp4'
 
         platform_name, platform_emoji = detect_platform(url)
-        is_yt = is_youtube_url(url)
 
+        # 1. Spotify
+        if platform_name == "Spotify":
+            return self._sync_download_spotify(url, output_template, temp_subfolder)
+
+        # 2. TikTok (Primary: TikWM API)
+        if platform_name == "TikTok":
+            try:
+                return download_tiktok_fast(url, format_type, temp_subfolder)
+            except Exception as e_tt:
+                logger.warning(f"TikWM falló ({e_tt}), intentando yt-dlp como fallback...")
+
+        # 3. X / Twitter (Primary: FxTwitter API)
+        if platform_name in ("X (Twitter)", "Twitter"):
+            try:
+                return download_twitter_fast(url, temp_subfolder, format_type=format_type)
+            except Exception as e_tw:
+                logger.warning(f"FxTwitter falló ({e_tw}), intentando yt-dlp como fallback...")
+
+        # 4. Instagram (Primary: Zero-Cookies Polaris GraphQL + Bridge)
         if platform_name == "Instagram":
-            url = normalize_instagram_url(url)
-            has_session = False
-            if self.cookies_file and os.path.exists(self.cookies_file):
-                try:
-                    with open(self.cookies_file, 'r', errors='ignore') as cf:
-                        has_session = 'sessionid' in cf.read()
-                except Exception:
-                    pass
-            logger.info(f"📸 Intento de descarga Instagram: cookies_file={self.cookies_file}, sessionid_activo={has_session}")
+            norm_url = normalize_instagram_url(url)
+            try:
+                return download_instagram_zero_cookies(norm_url, temp_subfolder, format_type=format_type)
+            except Exception as e_ig:
+                logger.warning(f"Instagram Zero-Cookies falló ({e_ig}), intentando yt-dlp fallback...")
 
+        # 5. YouTube (Bridge attempt first on cloud datacenter IPs)
+        if platform_name in ("YouTube", "YouTube Music"):
+            bridge_res = download_youtube_bridge(url, format_type, temp_subfolder)
+            if bridge_res:
+                return bridge_res
+
+        # 6. General Engine (yt-dlp with rotating clients, cookies if present)
         ydl_opts: Dict[str, Any] = {
             'outtmpl': output_template,
             'writethumbnail': True,
@@ -1149,22 +1057,8 @@ class VideoDownloader:
             'fragment_retries': 5,
         }
 
-        # For non-YouTube and non-Instagram platforms, set standard User-Agent.
-        # For YouTube and Instagram, DO NOT override User-Agent so yt-dlp matches internal client and TLS impersonation signatures.
-        if not is_yt and platform_name != "Instagram":
-            ydl_opts['http_headers'] = {
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/124.0.0.0 Safari/537.36'
-                ),
-                'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-            }
-
-        # JS runtime configuration for n-challenge solving
-        js_cfg = get_js_runtimes_config()
-        if js_cfg:
-            ydl_opts['js_runtimes'] = js_cfg
+        if self.cookies_file and os.path.exists(self.cookies_file):
+            ydl_opts['cookiefile'] = self.cookies_file
 
         if format_type == 'mp3':
             ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
@@ -1179,139 +1073,50 @@ class VideoDownloader:
                 'bestvideo[height<=720]+bestaudio/'
                 'best[height<=720][ext=mp4]/'
                 'best[height<=720]/'
-                'bestvideo+bestaudio/best'
+                'best'
             )
             ydl_opts['merge_output_format'] = 'mp4'
 
-        if self.cookies_file:
-            ydl_opts['cookiefile'] = self.cookies_file
-
-        # 1. TikTok special handling: try yt-dlp first; if blocked or photos, fallback to TikWM API directly
-        if platform_name == "TikTok":
-            try:
-                active_ydl = yt_dlp.YoutubeDL(ydl_opts)
-                info = active_ydl.extract_info(url, download=True)
-            except Exception as e_tt:
-                logger.warning(f"yt-dlp falló para TikTok ({e_tt}), ejecutando descarga via TikWM API...")
-                try:
-                    return download_tiktok_via_api(url, format_type, temp_subfolder)
-                except Exception as e_fallback:
-                    logger.error(f"TikWM fallback también falló: {e_fallback}")
-                    raise ValueError(f"No se pudo descargar el contenido de TikTok: {e_tt}")
-
-        # 2. X (Twitter) special handling: try yt-dlp first; if blocked (+18/NSFW) or photos, fallback to FxTwitter
-        elif platform_name in ("X (Twitter)", "Twitter"):
-            try:
-                active_ydl = yt_dlp.YoutubeDL(ydl_opts)
-                info = active_ydl.extract_info(url, download=True)
-            except Exception as e_tw:
-                logger.warning(f"yt-dlp falló para X/Twitter ({e_tw}), ejecutando descarga via FxTwitter API fallback...")
-                try:
-                    return download_twitter_fallback(url, temp_subfolder, format_type=format_type)
-                except Exception as e_tw_fallback:
-                    logger.error(f"FxTwitter fallback también falló: {e_tw_fallback}")
-                    raise ValueError(f"No se pudo descargar el contenido de X (Twitter): {e_tw_fallback}")
-
-        # 3. Instagram special handling: try yt-dlp first; if blocked (+18) or photos, fallback to Instagram API direct
-        elif platform_name == "Instagram":
-            try:
-                active_ydl = yt_dlp.YoutubeDL(ydl_opts)
-                info = active_ydl.extract_info(url, download=True)
-            except Exception as e_ig:
-                logger.warning(f"yt-dlp falló para Instagram ({e_ig}), intentando descarga directa...")
-                try:
-                    return download_instagram_direct(url, temp_subfolder, cookies_file=self.cookies_file, format_type=format_type)
-                except Exception as e_ig_fallback:
-                    logger.error(f"Instagram direct download también falló: {e_ig_fallback}")
-                    err_lower = str(e_ig).lower()
-                    if any(k in err_lower for k in [
-                        'ciertas audiencias', 'audiences', 'restricted', 'restricción',
-                        'empty media response', 'login', 'checkpoint', 'disponible para todo el mundo'
-                    ]):
-                        raise ValueError(
-                            "🔒 Contenido con Restricción de Edad o Audiencia en Instagram.\n\n"
-                            "Instagram bloquea el acceso anónimo a esta publicación (contenido clasificado como videojuegos, edad mínima de cuenta o audiencia restringida).\n\n"
-                            "💡 Para descargar videos o fotos con restricción: Añade tu sesión de Instagram en tu archivo .env o en las variables de entorno de tu hosting:\n"
-                            "INSTAGRAM_SESSIONID=tu_session_id\n\n"
-                            "(Obtén el valor de la cookie 'sessionid' desde instagram.com en tu navegador -> F12 -> Almacenamiento/Storage -> Cookies)"
-                        )
-                    raise ValueError(f"No se pudo descargar el contenido de Instagram: {e_ig_fallback}")
-
+        is_yt = is_youtube_url(url)
+        attempts = []
+        if is_yt:
+            if self.cookies_file and os.path.exists(self.cookies_file):
+                attempts.append(("con cookies", None, True))
+            attempts.append(("visionos", ['visionos'], False))
+            attempts.append(("android_vr", ['android_vr'], False))
+            attempts.append(("tv", ['tv'], False))
+            attempts.append(("web", ['web'], False))
         else:
-            # Execution with sequential client and cookie fallbacks for YouTube
-            # Note: Certain clients like 'android', 'ios' do NOT support cookies in yt-dlp and will be skipped
-            # if cookiefile is present. Furthermore, if cookies are expired, flagged, or in SABR experiment,
-            # YouTube responds with "The page needs to be reloaded" or returns 0 formats.
-            # Therefore, we try with cookies (if available), then clean attempts without cookies, and across clients.
-            if is_yt:
-                has_cookies = bool(self.cookies_file and os.path.exists(self.cookies_file))
-                attempts = []
-                # 1. If cookies are provided, try with cookies FIRST (essential for datacenter IPs like Render / VPS)
-                if has_cookies:
-                    attempts.append(("default (con cookies)", None, True))
-                    attempts.append(("web (con cookies)", ['web'], True))
-                # 2. VisionOS client (Resilient client without cookies)
-                attempts.append(("visionos (sin cookies)", ['visionos'], False))
-                # 3. Android VR client
-                attempts.append(("android_vr (sin cookies)", ['android_vr'], False))
-                # 4. Clean default client WITHOUT cookies
-                attempts.append(("default (sin cookies)", None, False))
-                # 5. Android client WITHOUT cookies
-                attempts.append(("android (sin cookies)", ['android'], False))
-                # 6. Web client WITHOUT cookies
-                attempts.append(("web (sin cookies)", ['web'], False))
-                # 7. iOS client WITHOUT cookies
-                attempts.append(("ios (sin cookies)", ['ios'], False))
-            else:
-                attempts = [("default", None, bool(self.cookies_file))]
+            attempts.append(("default", None, bool(self.cookies_file)))
 
-            info = None
-            active_ydl = None
-            last_error = None
+        info = None
+        active_ydl = None
+        last_error = None
 
-            for attempt_name, client, use_cookies in attempts:
-                attempt_opts = dict(ydl_opts)
-                if not use_cookies:
+        for attempt_name, client, use_cookies in attempts:
+            attempt_opts = dict(ydl_opts)
+            if not use_cookies:
+                attempt_opts.pop('cookiefile', None)
+            if client:
+                attempt_opts['extractor_args'] = {'youtube': {'player_client': client}}
+                if any(c in ('android', 'ios', 'visionos', 'android_vr', 'tv') for c in client):
                     attempt_opts.pop('cookiefile', None)
-                if client:
-                    attempt_opts['extractor_args'] = {'youtube': {'player_client': client}}
-                    # Ensure clients that do not support cookies never receive a cookiefile
-                    if any(c in ('android', 'ios', 'visionos', 'android_vr') for c in client):
-                        attempt_opts.pop('cookiefile', None)
 
-                try:
-                    active_ydl = yt_dlp.YoutubeDL(attempt_opts)
-                    info = active_ydl.extract_info(url, download=True)
-                    if info:
-                        logger.info(f"✅ Descarga exitosa de YouTube usando estrategia: {attempt_name}")
-                        break
-                except Exception as e:
-                    last_error = e
-                    err_msg = str(e)
-                    logger.warning(f"Download attempt '{attempt_name}' failed: {err_msg}")
-                    if 'Private video' in err_msg or 'This video is private' in err_msg:
-                        raise ValueError("El video es privado o no está disponible.")
-                    elif 'Video unavailable' in err_msg:
-                        raise ValueError("El video no está disponible o fue eliminado.")
-                    continue
+            try:
+                active_ydl = yt_dlp.YoutubeDL(attempt_opts)
+                info = active_ydl.extract_info(url, download=True)
+                if info:
+                    logger.info(f"✅ Descarga completada usando estrategia: {attempt_name}")
+                    break
+            except Exception as e:
+                last_error = e
+                logger.debug(f"Attempt {attempt_name} falló: {e}")
+                continue
 
         if not info:
-            err_text = str(last_error or "Error desconocido")
-            err_lower = err_text.lower()
-            if any(k in err_lower for k in ['sign in to confirm your age', 'inappropriate for some users', 'age-restricted', 'restricción de edad']):
-                raise ValueError(
-                    "🔒 Este video de YouTube tiene restricción de edad (+18) o requiere inicio de sesión.\n\n"
-                    "💡 Para descargarlo: Envía tu archivo cookies.txt al bot o usa el comando /set_yt."
-                )
-            elif 'sign in to confirm you’re not a bot' in err_lower or 'bot' in err_lower or 'failed to extract any player response' in err_lower:
-                raise ValueError(
-                    "YouTube ha bloqueado temporalmente las descargas para la IP del servidor en la nube (Render). "
-                    "Para solucionarlo de inmediato, añade tus cookies en la variable de entorno YOUTUBE_COOKIES en Render o usa /set_yt."
-                )
-            raise ValueError(f"Error al descargar: {err_text}")
+            raise ValueError(f"No se pudo descargar el contenido: {last_error or 'Error de extracción'}")
 
         if 'entries' in info and info['entries']:
-            # Prioritize video entries in carousel posts
             video_entries = [
                 e for e in info['entries']
                 if e and (
@@ -1320,10 +1125,7 @@ class VideoDownloader:
                     or e.get('video_ext') not in (None, 'none')
                 )
             ]
-            if video_entries:
-                info = video_entries[0]
-            else:
-                info = info['entries'][0]
+            info = video_entries[0] if video_entries else info['entries'][0]
 
         title = info.get('title', 'Video')
         uploader = info.get('uploader') or info.get('channel') or platform_name
@@ -1331,13 +1133,13 @@ class VideoDownloader:
         width = info.get('width')
         height = info.get('height')
 
-        base_filename = active_ydl.prepare_filename(info)
+        base_filename = active_ydl.prepare_filename(info) if active_ydl else ""
         result_file = None
 
         if format_type == 'mp3':
-            target_mp3 = os.path.splitext(base_filename)[0] + '.mp3'
-            if os.path.exists(target_mp3):
-                result_file = target_mp3
+            mp3_cand = os.path.splitext(base_filename)[0] + '.mp3'
+            if os.path.exists(mp3_cand) and os.path.getsize(mp3_cand) > 0:
+                result_file = mp3_cand
             else:
                 for f in os.listdir(temp_subfolder):
                     if f.lower().endswith('.mp3'):
@@ -1354,34 +1156,17 @@ class VideoDownloader:
                     break
 
             if not result_file:
-                prefix = os.path.splitext(base_filename)[0]
-                matches = glob.glob(f"{glob.escape(prefix)}*")
-                for m in matches:
-                    if m.lower().endswith(('.mp4', '.mkv', '.webm', '.mov')) and os.path.getsize(m) > 0:
-                        result_file = m
+                for f in os.listdir(temp_subfolder):
+                    if f.lower().endswith(('.mp4', '.mkv', '.webm', '.mov')) and os.path.getsize(os.path.join(temp_subfolder, f)) > 0:
+                        result_file = os.path.join(temp_subfolder, f)
                         break
 
         if not result_file or not os.path.exists(result_file):
-            if platform_name in ("X (Twitter)", "Twitter"):
-                try:
-                    return download_twitter_fallback(url, temp_subfolder, format_type=format_type)
-                except Exception:
-                    pass
-            elif platform_name == "Instagram":
-                try:
-                    return download_instagram_direct(url, temp_subfolder, cookies_file=self.cookies_file, format_type=format_type)
-                except Exception:
-                    pass
-            elif platform_name == "TikTok":
-                try:
-                    return download_tiktok_via_api(url, format_type, temp_subfolder)
-                except Exception:
-                    pass
-            raise FileNotFoundError(f"No se encontró el archivo descargado.")
+            raise FileNotFoundError("No se encontró el archivo multimedia descargado.")
 
         file_size = os.path.getsize(result_file)
 
-        # Compress video if slightly over 50MB
+        # Auto-compression if slightly over 50MB
         if format_type == 'mp4' and file_size > MAX_TELEGRAM_SIZE_BYTES:
             if duration and 0 < duration < 1800:
                 compressed_path = os.path.join(temp_subfolder, 'compressed_video.mp4')
@@ -1395,7 +1180,7 @@ class VideoDownloader:
                 f"superando el límite de 50 MB de Telegram."
             )
 
-        # Look for thumbnail
+        # Convert thumbnail
         raw_thumb = None
         thumb_prefix = os.path.splitext(base_filename)[0]
         for ext in ['.jpg', '.jpeg', '.webp', '.png']:
@@ -1405,6 +1190,9 @@ class VideoDownloader:
                 break
 
         final_thumb = convert_thumbnail_to_jpg(raw_thumb, result_file, temp_subfolder)
+
+        if format_type == 'mp3':
+            apply_id3_tags(result_file, title, uploader, final_thumb)
 
         return {
             'type': 'audio' if (format_type == 'mp3') else 'video',
@@ -1423,7 +1211,7 @@ class VideoDownloader:
         }
 
     async def download(self, url: str, format_type: str = "mp4") -> Dict[str, Any]:
-        """Asynchronously downloads media."""
+        """Asynchronously downloads media into an isolated temporary directory."""
         temp_subfolder = tempfile.mkdtemp(dir=self.temp_dir, prefix="tgbot_")
         output_template = os.path.join(temp_subfolder, '%(id)s.%(ext)s')
 

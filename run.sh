@@ -1,16 +1,25 @@
 #!/bin/bash
 set -e
 
-# Change directory to script folder
-cd "$(dirname "$0")"
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+cd "$DIR"
 
-# Create venv if it does not exist
-if [ ! -d "venv" ]; then
-    echo "📦 Creando entorno virtual..."
-    python3 -m venv venv
-    ./venv/bin/pip install --upgrade pip
-    ./venv/bin/pip install -r requirements.txt
+# Verificar si existe .env
+if [ ! -f .env ]; then
+    echo "⚠️ Archivo .env no encontrado. Creando a partir de .env.example..."
+    cp .env.example .env
+    echo "❗ Por favor edita el archivo .env con tu TELEGRAM_BOT_TOKEN antes de continuar."
+    exit 1
 fi
 
-# Run the bot
-./venv/bin/python bot.py
+# Detectar python virtualenv si existe
+if [ -d "venv" ]; then
+    PYTHON="./venv/bin/python"
+elif [ -d "/home/jonparrow/Proyectos/botnew/venv" ]; then
+    PYTHON="/home/jonparrow/Proyectos/botnew/venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
+echo "🚀 Iniciando Bot Multimedia Zero-Cookies..."
+exec "$PYTHON" bot.py

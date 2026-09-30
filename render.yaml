@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-downloader-bot
+    env: docker
+    plan: free
+    region: oregon
+    dockerfilePath: Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TIMEZONE
+        value: America/New_York
+      - key: ADMIN_IDS
+        sync: false
+      - key: PORT
+        value: 8080
