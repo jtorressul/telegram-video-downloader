@@ -568,11 +568,11 @@ def download_instagram_direct(
 
     if not data or not data.get('items'):
         raise ValueError(
-            "🔒 Contenido con Restricción de Edad o Audiencia en Instagram (+18).\n\n"
-            "Instagram bloquea el acceso anónimo a este contenido (+18 o audiencia sensible).\n\n"
-            "💡 Para descargar videos o fotos restringidos: Añade tu sesión de Instagram en tu archivo .env:\n"
+            "🔒 Contenido con Restricción de Edad o Audiencia en Instagram.\n\n"
+            "Instagram bloquea el acceso anónimo a esta publicación (contenido clasificado como videojuegos, edad mínima de cuenta o audiencia restringida).\n\n"
+            "💡 Para descargar videos o fotos con restricción: Añade tu sesión de Instagram en tu archivo .env o en las variables de entorno de tu hosting:\n"
             "INSTAGRAM_SESSIONID=tu_session_id\n\n"
-            "(Obtén el valor de la cookie 'sessionid' desde instagram.com en tu navegador -> F12 -> Almacenamiento -> Cookies)"
+            "(Obtén el valor de la cookie 'sessionid' desde instagram.com en tu navegador -> F12 -> Almacenamiento/Storage -> Cookies)"
         )
 
     item = data['items'][0]
@@ -810,11 +810,11 @@ def normalize_instagram_url(url: str) -> str:
         if path.startswith('/reels/'):
             path = '/reel/' + path[7:]
 
-        # 3. Strip tracking parameters (?igsh=..., utm_*, etc.)
+        # 3. Strip tracking and share parameters (?igsh=..., ?stkn=..., utm_*, etc.)
         qs = parse_qs(parsed.query)
         filtered_qs = {
             k: v for k, v in qs.items()
-            if not (k.startswith('utm_') or k in ['igsh', 'ig_mid', 'src', 'fbclid', 'ig_rid'])
+            if not (k.startswith('utm_') or k in ['igsh', 'ig_mid', 'src', 'fbclid', 'ig_rid', 'stkn'])
         }
         from urllib.parse import urlencode
         clean_query = urlencode(filtered_qs, doseq=True) if filtered_qs else ""
@@ -830,30 +830,55 @@ def normalize_instagram_url(url: str) -> str:
 
 def setup_cookies_file(cookies_path: str = "cookies.txt") -> Optional[str]:
     """
-    Sets up cookies from environment variable if present, or checks existing file,
+    Sets up cookies from environment variables if present, merges them with existing file,
     or automatically exports relevant cookies from installed local browsers (Firefox, Chrome, etc.).
-    Supports YOUTUBE_COOKIES, COOKIES_CONTENT, INSTAGRAM_COOKIES, and INSTAGRAM_SESSIONID.
+    Supports COOKIES_CONTENT, YOUTUBE_COOKIES, INSTAGRAM_COOKIES, and INSTAGRAM_SESSIONID.
     """
-    cookies_env = (
-        os.getenv("COOKIES_CONTENT")
-        or os.getenv("YOUTUBE_COOKIES")
-        or os.getenv("INSTAGRAM_COOKIES")
-    )
     ig_sessionid = os.getenv("INSTAGRAM_SESSIONID") or os.getenv("IG_SESSIONID")
+    env_sources = [
+        os.getenv("COOKIES_CONTENT"),
+        os.getenv("YOUTUBE_COOKIES"),
+        os.getenv("INSTAGRAM_COOKIES"),
+    ]
 
-    lines = []
-    if cookies_env and cookies_env.strip():
-        lines.append(cookies_env.strip())
+    existing_lines = []
+    if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+        try:
+            with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
+                existing_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        except Exception:
+            existing_lines = []
+
+    new_lines = []
+    for src in env_sources:
+        if src and src.strip():
+            for line in src.strip().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    new_lines.append(line)
 
     if ig_sessionid and ig_sessionid.strip():
         sid = ig_sessionid.strip()
-        lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sid}")
+        user_id = sid.split('%3A')[0].split(':')[0]
+        if user_id.isdigit():
+            new_lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tds_user_id\t{user_id}")
+        new_lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sid}")
 
-    if lines:
+    if new_lines:
+        cookies_dict = {}
+        for l in existing_lines + new_lines:
+            parts = l.split('\t')
+            if len(parts) >= 7:
+                domain, name = parts[0], parts[5]
+                cookies_dict[(domain, name)] = l
+            else:
+                cookies_dict[l] = l
+
         try:
             with open(cookies_path, "w", encoding="utf-8") as f:
-                header = "# Netscape HTTP Cookie File\n" if not any(l.startswith("#") for l in lines) else ""
-                f.write(header + "\n".join(lines) + "\n")
+                f.write("# Netscape HTTP Cookie File\n")
+                for c_line in cookies_dict.values():
+                    f.write(c_line + "\n")
             return cookies_path
         except Exception as e:
             logger.warning(f"Error escribiendo archivo de cookies: {e}")
@@ -1131,11 +1156,11 @@ class VideoDownloader:
                         'empty media response', 'login', 'checkpoint', 'disponible para todo el mundo'
                     ]):
                         raise ValueError(
-                            "🔒 Contenido con Restricción de Edad o Audiencia en Instagram (+18).\n\n"
-                            "Instagram bloquea el acceso anónimo a este contenido (+18 o audiencia sensible).\n\n"
-                            "💡 Para descargar videos o fotos restringidos: Añade tu sesión de Instagram en tu archivo .env:\n"
+                            "🔒 Contenido con Restricción de Edad o Audiencia en Instagram.\n\n"
+                            "Instagram bloquea el acceso anónimo a esta publicación (contenido clasificado como videojuegos, edad mínima de cuenta o audiencia restringida).\n\n"
+                            "💡 Para descargar videos o fotos con restricción: Añade tu sesión de Instagram en tu archivo .env o en las variables de entorno de tu hosting:\n"
                             "INSTAGRAM_SESSIONID=tu_session_id\n\n"
-                            "(Obtén el valor de la cookie 'sessionid' desde instagram.com en tu navegador -> F12 -> Almacenamiento -> Cookies)"
+                            "(Obtén el valor de la cookie 'sessionid' desde instagram.com en tu navegador -> F12 -> Almacenamiento/Storage -> Cookies)"
                         )
                     raise ValueError(f"No se pudo descargar el contenido de Instagram: {e_ig_fallback}")
 
