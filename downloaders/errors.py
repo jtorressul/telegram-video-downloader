@@ -79,6 +79,13 @@ class TooLarge(DownloadError):
     priority = 8
 
 
+class Cancelled(DownloadError):
+    """The user cancelled the download; never shown as a failure."""
+    user_message = "🛑 Descarga cancelada."
+    content_error = True
+    priority = 99
+
+
 _RULES = [
     # TikTok status codes: 10231/10204/10216/10222 are logged-out / region / age gates
     (RegionOrAgeLocked, r"status code (10231|10204|10216|10222)|confirm your age|age[- ]restricted|"

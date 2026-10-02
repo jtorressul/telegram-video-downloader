@@ -2,13 +2,14 @@
 import logging
 import os
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 import config
 from . import health
-from .errors import DownloadError, Unknown, classify
+from .errors import Cancelled, DownloadError, Unknown, classify
 from .net import DIRECT, Route, available_routes
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,8 @@ class Strategy:
 
 
 def run_chain(platform: str, strategies: List[Strategy], url: str, format_type: str,
-              workdir: str, routes: Optional[List[Route]] = None) -> Dict[str, Any]:
+              workdir: str, routes: Optional[List[Route]] = None,
+              cancel: Optional[threading.Event] = None) -> Dict[str, Any]:
     routes = routes or available_routes()
     deadline = time.time() + config.DOWNLOAD_DEADLINE_SECONDS
     errors: List[DownloadError] = []
@@ -41,6 +43,8 @@ def run_chain(platform: str, strategies: List[Strategy], url: str, format_type: 
         if not strat.enabled():
             continue
         for route in (routes if strat.route_sensitive else [DIRECT]):
+            if cancel is not None and cancel.is_set():
+                raise Cancelled("cancelado por el usuario")
             if time.time() > deadline:
                 logger.warning(f"[{platform}] presupuesto de tiempo agotado")
                 return _raise_best(errors)

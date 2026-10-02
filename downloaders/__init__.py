@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import threading
 from typing import Any, Dict, Optional
 
 from . import facebook, instagram, spotify, tiktok, twitter, youtube
@@ -58,7 +59,8 @@ class VideoDownloader:
         # cookies_file kept for signature compatibility; cookies are read via config.resolve_cookies_file()
         self.temp_dir = temp_dir or tempfile.gettempdir()
 
-    def _sync_download(self, url: str, format_type: str, workdir: str) -> Dict[str, Any]:
+    def _sync_download(self, url: str, format_type: str, workdir: str,
+                       cancel: Optional[threading.Event] = None) -> Dict[str, Any]:
         format_type = format_type.lower().strip()
         if format_type not in ('mp3', 'mp4'):
             format_type = 'mp4'
@@ -66,15 +68,30 @@ class VideoDownloader:
         if platform == "Spotify":
             format_type = 'mp3'
         url = prepare_url(url, platform)
-        return run_chain(platform, strategies_for(platform, emoji), url, format_type, workdir)
+        return run_chain(platform, strategies_for(platform, emoji), url, format_type, workdir, cancel=cancel)
 
-    async def download(self, url: str, format_type: str = "mp4") -> Dict[str, Any]:
-        """Downloads media into an isolated temporary directory (cleaned up via cleanup())."""
+    async def download(self, url: str, format_type: str = "mp4",
+                       cancel: Optional[threading.Event] = None) -> Dict[str, Any]:
+        """Downloads media into an isolated temporary directory (cleaned up via cleanup()).
+
+        If the awaiting task is cancelled, the worker thread can't be killed mid-download: it stops
+        before its next strategy (via `cancel`) and its files are removed once it finishes.
+        """
         workdir = new_workdir(self.temp_dir)
+        cancel = cancel or threading.Event()
+        worker = asyncio.ensure_future(asyncio.to_thread(self._sync_download, url, format_type, workdir, cancel))
         try:
-            result = await asyncio.to_thread(self._sync_download, url, format_type, workdir)
+            result = await asyncio.shield(worker)
             result['temp_dir'] = workdir
             return result
+        except asyncio.CancelledError:
+            cancel.set()
+            def discard(fut):
+                if not fut.cancelled():
+                    fut.exception()  # mark as retrieved: the outcome no longer matters
+                shutil.rmtree(workdir, ignore_errors=True)
+            worker.add_done_callback(discard)
+            raise
         except Exception:
             shutil.rmtree(workdir, ignore_errors=True)
             raise
