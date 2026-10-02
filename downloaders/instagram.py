@@ -17,7 +17,7 @@ import config
 from . import cobalt
 from .base import Strategy
 from .common import download_media_list, ydl_download
-from .errors import IPBlocked, NotFound, Private, RegionOrAgeLocked, Unknown, Unsupported
+from .errors import IPBlocked, NotFound, Private, RegionOrAgeLocked, Unavailable, Unknown, Unsupported
 from .net import Http, Route
 
 logger = logging.getLogger(__name__)
@@ -130,6 +130,9 @@ def _polaris(url: str, format_type: str, workdir: str, route: Route) -> Dict[str
         if node:
             # Meta returned the post but gated it for logged-out viewers (age / sensitive content)
             raise RegionOrAgeLocked("Polaris: contenido restringido para visitantes sin sesión")
+        if 'xig_polaris_media' in (data.get('data') or {}):
+            # Explicit null: deleted, private or +18 (Meta hides all three the same way)
+            raise Unavailable("Polaris: xig_polaris_media null")
         raise Unknown(f"Polaris sin datos: {str(data)[:150]}")
     caption = (item.get('caption') or {}).get('text')
     author = (item.get('user') or {}).get('username')
@@ -181,6 +184,9 @@ def _embed(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, 
     if not parsed:
         if 'EmbedIsBroken' in resp.text:
             raise Private("embed no disponible (privado o embeds desactivados)")
+        if 'may have been removed' in resp.text:
+            # Shown for deleted, private and +18 posts alike
+            raise Unavailable("embed: post eliminado, privado o +18")
         # No media: deleted post, logged-out gate or embeds disabled; other strategies decide
         raise Unknown("embed sin medios")
     if format_type == 'mp3' and not any(m['type'] == 'video' for m in parsed['media']):

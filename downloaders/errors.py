@@ -44,6 +44,16 @@ class NotFound(DownloadError):
     priority = 4
 
 
+class Unavailable(DownloadError):
+    """The platform answers but returns nothing to logged-out visitors (deleted, private or +18)."""
+    user_message = (
+        "🔍 Este contenido no está disponible públicamente: puede ser +18, privado "
+        "o haber sido eliminado."
+    )
+    content_error = True
+    priority = 4
+
+
 class RegionOrAgeLocked(DownloadError):
     user_message = (
         "🔞 La plataforma no muestra este contenido sin iniciar sesión "
@@ -78,9 +88,11 @@ _RULES = [
     (NotFound, r"\b404\b|not found|has been removed|no longer available|does not exist|"
                r"video unavailable|this post isn.t available|deleted"),
     (RateLimited, r"\b429\b|too many requests|rate.?limit"),
+    # yt-dlp's Instagram message for posts hidden from logged-out visitors
+    (Unavailable, r"empty media response"),
     (IPBlocked, r"\b403\b|forbidden|not a bot|sign in to confirm|login required|log in|"
                 r"requested content is not available|blocked|captcha|checkpoint|"
-                r"empty media response|unable to extract|timed? ?out|connection (reset|refused)"),
+                r"unable to extract|timed? ?out|connection (reset|refused)"),
 ]
 
 

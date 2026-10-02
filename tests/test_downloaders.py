@@ -7,8 +7,8 @@ import config
 from downloaders import base, health
 from downloaders.base import Strategy, run_chain
 from downloaders.common import detect_platform, extract_youtube_id
-from downloaders.errors import (IPBlocked, NotFound, Private, RateLimited, RegionOrAgeLocked, Unknown,
-                                classify)
+from downloaders.errors import (IPBlocked, NotFound, Private, RateLimited, RegionOrAgeLocked, Unavailable,
+                                Unknown, classify)
 from downloaders.instagram import (extract_instagram_shortcode, media_from_igexport, normalize_instagram_url,
                                   parse_embed_html)
 from downloaders.net import DIRECT, Route, random_ipv6
@@ -72,6 +72,7 @@ def test_tweet_url_and_token():
     ("HTTP Error 429: Too Many Requests", RateLimited),
     ("Private video", Private),
     ("Video unavailable", NotFound),
+    ("ERROR: [Instagram] X: Instagram sent an empty media response", Unavailable),
     ("something weird", Unknown),
 ])
 def test_classify(text, cls):
@@ -121,6 +122,12 @@ def test_content_error_skips_other_routes_but_tries_next_strategy(tmp_path):
 
     res = run_chain("Instagram", [Strategy("a", private), Strategy("b", _ok)], "u", "mp4", str(tmp_path), ROUTES)
     assert calls == ["directo"] and res["strategy"] == "b@directo"
+
+
+def test_unavailable_beats_ip_block_in_final_message(tmp_path):
+    with pytest.raises(Unavailable):
+        run_chain("Instagram", [Strategy("a", _fail(Unavailable("null"))), Strategy("b", _fail(IPBlocked("403")))],
+                  "u", "mp4", str(tmp_path), [DIRECT])
 
 
 def test_chain_raises_most_informative_error(tmp_path):
