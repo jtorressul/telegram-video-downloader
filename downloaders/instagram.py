@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from typing import Any, Dict, List, Optional
 
 import config
@@ -221,6 +222,24 @@ def _igexport(url: str, format_type: str, workdir: str, route: Route) -> Dict[st
     if not data.get('ok') or not media:
         raise Unknown(f"igexport sin medios: {str(data)[:150]}")
     return _download(media, format_type, workdir, sc, None, None, route)
+
+
+IGEXPORT_PROBE_URL = "https://www.instagram.com/p/aye83DjauH/"  # old public post, stable for years
+
+
+def igexport_status() -> str:
+    """One-line health of the igexport API (for the admin /estado command)."""
+    if not _igexport_enabled():
+        return "desactivado"
+    start = time.time()
+    try:
+        with Http(timeout=15) as http:
+            resp = http.get(f"{config.IGEXPORT_API}/api/ig-photo/", params={'url': IGEXPORT_PROBE_URL}, check=False)
+        if resp.status_code == 200 and media_from_igexport(resp.json()):
+            return f"✅ responde ({time.time() - start:.1f} s)"
+        return f"❌ HTTP {resp.status_code}"
+    except Exception as e:
+        return f"❌ {type(e).__name__}"
 
 
 def _ytdlp(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, Any]:

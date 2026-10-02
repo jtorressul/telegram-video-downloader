@@ -17,6 +17,7 @@ VIP_DAILY_LIMIT = 15
 
 SOCIAL_PLATFORMS = {"Instagram", "TikTok", "X (Twitter)", "Facebook"}
 HISTORY_KEEP = 50
+LOG_RETENTION_DAYS = 30
 
 
 def get_local_now() -> datetime:
@@ -80,6 +81,23 @@ class UserDatabase:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON download_history (user_id, id)")
+            # One row per delivery attempt, for admin stats (/estado, /top); pruned after LOG_RETENTION_DAYS
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS download_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    day TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    platform TEXT,
+                    cached INTEGER DEFAULT 0,
+                    ok INTEGER DEFAULT 1,
+                    created_at REAL NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_log_day ON download_log (day)")
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS known_groups (
                     group_id INTEGER PRIMARY KEY,
@@ -245,6 +263,83 @@ class UserDatabase:
                 WHERE user_id = ? GROUP BY url, format ORDER BY last_id DESC LIMIT ?
             """, (user_id, limit)).fetchall()
             return [dict(r) for r in rows]
+
+    # --- Admin: activity log ---------------------------------------------------------------
+    def log_download(self, user_id: int, platform: str, ok: bool, cached: bool = False):
+        with self._get_connection() as conn:
+            conn.execute("INSERT INTO download_log (day, user_id, platform, cached, ok, created_at) "
+                         "VALUES (?, ?, ?, ?, ?, ?)",
+                         (get_local_today_str(), user_id, platform, int(cached), int(ok), time.time()))
+            conn.commit()
+
+    def prune_download_log(self) -> int:
+        cutoff = time.time() - LOG_RETENTION_DAYS * 86400
+        with self._get_connection() as conn:
+            cur = conn.execute("DELETE FROM download_log WHERE created_at < ?", (cutoff,))
+            conn.commit()
+            return cur.rowcount
+
+    def platform_stats(self, day: str) -> list:
+        """[{platform, ok, cached, failed}] for one local day, busiest first."""
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT platform, SUM(ok) AS ok, SUM(ok AND cached) AS cached, SUM(1 - ok) AS failed
+                FROM download_log WHERE day = ? GROUP BY platform ORDER BY COUNT(*) DESC
+            """, (day,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def top_users(self, since_ts: float, limit: int = 10) -> list:
+        """[{user_id, username, first_name, downloads}] by successful downloads since since_ts."""
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT l.user_id, u.username, u.first_name, COUNT(*) AS downloads
+                FROM download_log l LEFT JOIN users u ON u.user_id = l.user_id
+                WHERE l.ok = 1 AND l.created_at >= ?
+                GROUP BY l.user_id ORDER BY downloads DESC LIMIT ?
+            """, (since_ts, limit)).fetchall()
+            return [dict(r) for r in rows]
+
+    def top_platforms(self, since_ts: float) -> list:
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT platform, COUNT(*) AS downloads FROM download_log
+                WHERE ok = 1 AND created_at >= ? GROUP BY platform ORDER BY downloads DESC
+            """, (since_ts,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def user_counts(self) -> Dict[str, int]:
+        today = get_local_today_str()
+        with self._get_connection() as conn:
+            row = conn.execute("""
+                SELECT COUNT(*) AS total,
+                       SUM(is_vip = 1) AS vip,
+                       SUM(is_banned = 1) AS banned,
+                       SUM(last_download_date = ? AND daily_downloads > 0) AS active_today
+                FROM users
+            """, (today,)).fetchone()
+            return {k: row[k] or 0 for k in ("total", "vip", "banned", "active_today")}
+
+    # --- Admin: VIP list / bans / broadcast ---------------------------------------------------
+    def get_vip_users(self) -> list:
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT user_id, username, first_name, vip_checked_at FROM users "
+                                "WHERE is_vip = 1 ORDER BY vip_checked_at DESC").fetchall()
+            return [dict(r) for r in rows]
+
+    def set_banned(self, user_id: int, banned: bool):
+        self.get_or_create_user(user_id)
+        with self._get_connection() as conn:
+            conn.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (int(banned), user_id))
+            conn.commit()
+
+    def is_banned(self, user_id: int) -> bool:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            return bool(row and row[0])
+
+    def get_broadcast_user_ids(self) -> list:
+        with self._get_connection() as conn:
+            return [r[0] for r in conn.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0")]
 
     def get_quota(self, user_id: int) -> Tuple[int, int]:
         """Returns (used_today, daily_limit) for the user."""

@@ -38,6 +38,8 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     InlineQueryHandler,
+    ApplicationHandlerStop,
+    TypeHandler,
     filters,
 )
 
@@ -53,6 +55,7 @@ from downloaders import (
 )
 from downloaders import health
 from downloaders.errors import Cancelled
+from downloaders.instagram import igexport_status
 from downloaders.diag import run_diagnostics
 from cache import VideoCache
 from db import (
@@ -205,6 +208,13 @@ GROUP_ADMIN_COMMANDS = [
     ("unvip", "Quitar VIP (responde al usuario)", "<code>/unvip</code> - Quita el VIP del mismo modo."),
 ]
 BOT_ADMIN_COMMANDS = [
+    ("estado", "Resumen del bot hoy", "<code>/estado</code> - Descargas de hoy, usuarios, estrategias en pausa e igexport."),
+    ("top", "Usuarios y plataformas más activos", "<code>/top [días]</code> - Más activos (7 días por defecto)."),
+    ("viplist", "Lista de VIP", "<code>/viplist</code> - Usuarios VIP y su última verificación."),
+    ("ban", "Bloquear usuario", "<code>/ban</code> - Responde a un usuario o usa <code>/ban [id]</code>."),
+    ("unban", "Desbloquear usuario", "<code>/unban [id]</code> - Quita el bloqueo."),
+    ("broadcast", "Mensaje a todos los usuarios",
+     "<code>/broadcast [texto]</code> o respondiendo a un mensaje - Envío masivo con confirmación."),
     ("diag", "Diagnóstico de red y estrategias", "<code>/diag</code> - Diagnóstico de red y estrategias."),
 ]
 
@@ -231,6 +241,9 @@ async def schedule_midnight_quota_reset():
 
             count = user_db.reset_all_daily_quotas()
             logger.info(f"✅ Reinicio automático de medianoche completado: {count} usuarios reiniciados.")
+            pruned = user_db.prune_download_log()
+            if pruned:
+                logger.info(f"🧹 Registro de descargas: {pruned} entradas antiguas eliminadas.")
         except asyncio.CancelledError:
             logger.info("🛑 Tarea de reinicio de cuotas cancelada limpiamente.")
             break
@@ -594,6 +607,220 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     text = report + ("\n\n── Estrategias\n" + "\n".join(stats_lines) if stats_lines else "")
     await msg.edit_text(f"<pre>{html.escape(text[:3900])}</pre>", parse_mode=ParseMode.HTML)
+
+
+# --- Bot admin commands (ADMIN_IDS only) -------------------------------------------------------
+def is_bot_admin(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id in ADMIN_IDS)
+
+
+def user_label(row: dict) -> str:
+    if row.get('username'):
+        return f"@{html.escape(row['username'])}"
+    return html.escape(row.get('first_name') or str(row['user_id']))
+
+
+def ago(ts: Optional[float]) -> str:
+    if not ts:
+        return "nunca"
+    minutes = int((time.time() - ts) // 60)
+    if minutes < 60:
+        return f"hace {minutes} min"
+    if minutes < 48 * 60:
+        return f"hace {minutes // 60} h"
+    return f"hace {minutes // 1440} d"
+
+
+async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: today's activity, users, paused strategies and igexport health."""
+    if not is_bot_admin(update):
+        return
+    stats = user_db.platform_stats(get_local_today_str())
+    ok = sum(s['ok'] or 0 for s in stats)
+    cached = sum(s['cached'] or 0 for s in stats)
+    failed = sum(s['failed'] or 0 for s in stats)
+    users = user_db.user_counts()
+    in_flight = sum(1 for tasks in active_downloads.values() for t in tasks if not t.done())
+    paused = [f"{name} ({st['paused_s']} s)" for name, st in health.snapshot().items() if st['paused_s']]
+    igexport = await asyncio.to_thread(igexport_status)
+
+    lines = [
+        "📈 <b>Estado del bot (hoy)</b>\n",
+        f"📥 <b>Descargas:</b> {ok} ✅ ({cached} desde caché) · {failed} ❌",
+    ]
+    for s in stats:
+        lines.append(f"   • {html.escape(s['platform'] or '?')}: {s['ok'] or 0} ✅ · {s['failed'] or 0} ❌")
+    lines += [
+        f"⏳ <b>En curso ahora:</b> {in_flight}",
+        f"\n👥 <b>Usuarios:</b> {users['total']} · activos hoy {users['active_today']} · "
+        f"VIP {users['vip']} · bloqueados {users['banned']}",
+        f"🏘 <b>Grupos conocidos:</b> {len(user_db.get_known_groups())}",
+        f"\n⏸ <b>Estrategias en pausa:</b> {', '.join(paused) if paused else 'ninguna'}",
+        f"📸 <b>igexport (+18 IG):</b> {igexport}",
+    ]
+    await update.message.reply_html("\n".join(lines))
+
+
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: most active users and platforms over the last N days (default 7)."""
+    if not is_bot_admin(update):
+        return
+    days = int(context.args[0]) if context.args and context.args[0].isdigit() else 7
+    days = max(1, min(days, 30))  # the log keeps 30 days
+    since = time.time() - days * 86400
+    users = user_db.top_users(since)
+    platforms = user_db.top_platforms(since)
+    if not users:
+        await update.message.reply_html(f"📭 Sin descargas en los últimos {days} días.")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"🏆 <b>Top últimos {days} días</b>\n", "<b>Usuarios:</b>"]
+    for idx, row in enumerate(users):
+        prefix = medals[idx] if idx < 3 else f"{idx + 1}."
+        lines.append(f"{prefix} {user_label(row)} — {row['downloads']}")
+    lines.append("\n<b>Plataformas:</b>")
+    lines += [f"• {html.escape(p['platform'] or '?')} — {p['downloads']}" for p in platforms]
+    await update.message.reply_html("\n".join(lines))
+
+
+async def viplist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: VIP users and when their group title was last verified."""
+    if not is_bot_admin(update):
+        return
+    vips = [v for v in user_db.get_vip_users() if v['user_id'] not in ADMIN_IDS]
+    if not vips:
+        await update.message.reply_html("👑 No hay usuarios VIP (aparte de los admins del bot).")
+        return
+    lines = [f"👑 <b>VIP ({len(vips)})</b> — verificados por título de grupo\n"]
+    for v in vips[:50]:
+        lines.append(f"• {user_label(v)} <code>{v['user_id']}</code> — verificado {ago(v.get('vip_checked_at'))}")
+    if len(vips) > 50:
+        lines.append(f"… y {len(vips) - 50} más")
+    await update.message.reply_html("\n".join(lines))
+
+
+def _target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    reply = update.message.reply_to_message
+    if reply and reply.from_user:
+        return reply.from_user.id
+    if context.args and context.args[0].lstrip("-").isdigit():
+        return int(context.args[0])
+    return None
+
+
+async def ban_management_command(update: Update, context: ContextTypes.DEFAULT_TYPE, ban: bool):
+    if not is_bot_admin(update):
+        return
+    target_id = _target_user_id(update, context)
+    cmd = "ban" if ban else "unban"
+    if not target_id:
+        await update.message.reply_html(
+            f"ℹ️ <b>Uso:</b> responde al mensaje de un usuario con <code>/{cmd}</code> o usa <code>/{cmd} [user_id]</code>.")
+        return
+    if ban and target_id in ADMIN_IDS:
+        await update.message.reply_html("❌ No se puede bloquear a un administrador del bot.")
+        return
+    user_db.set_banned(target_id, ban)
+    if ban:
+        cancel_user_downloads(target_id)
+        await update.message.reply_html(f"🚫 Usuario <code>{target_id}</code> bloqueado: el bot lo ignorará.")
+    else:
+        await update.message.reply_html(f"✅ Usuario <code>{target_id}</code> desbloqueado.")
+
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ban_management_command(update, context, True)
+
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ban_management_command(update, context, False)
+
+
+async def ban_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs before every handler: banned users are ignored everywhere (admins can't be banned)."""
+    user = update.effective_user
+    if not user or user.id in ADMIN_IDS or not user_db.is_banned(user.id):
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("🚫 No tienes acceso al bot.", show_alert=True)
+        elif update.inline_query:
+            await update.inline_query.answer([], cache_time=300, is_personal=True)
+        elif update.message and update.effective_chat.type == ChatType.PRIVATE:
+            await update.message.reply_text("🚫 No tienes acceso al bot.")
+    except Exception:
+        pass
+    raise ApplicationHandlerStop
+
+
+BROADCAST_DELAY_S = 0.05  # ~20 msg/s, under Telegram's ~30 msg/s bot limit
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: prepares a broadcast (replied message or text) and asks for confirmation."""
+    if not is_bot_admin(update):
+        return
+    reply = update.message.reply_to_message
+    text = update.message.text.partition(" ")[2].strip() if update.message.text else ""
+    if reply:
+        payload = {"from_chat_id": reply.chat_id, "message_id": reply.message_id}
+    elif text:
+        payload = {"text": text}
+    else:
+        await update.message.reply_html(
+            "ℹ️ <b>Uso:</b> <code>/broadcast texto</code>, o responde a cualquier mensaje "
+            "(foto, video, texto con formato…) con <code>/broadcast</code> para reenviarlo tal cual.")
+        return
+    recipients = len(user_db.get_broadcast_user_ids())
+    context.bot_data.setdefault('broadcast_pending', {})[update.effective_user.id] = payload
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Enviar a {recipients}", callback_data="bc:send"),
+        InlineKeyboardButton("✖️ Cancelar", callback_data="bc:cancel"),
+    ]])
+    preview = f"\n\n<i>{html.escape(text[:300])}</i>" if text else " (el mensaje al que respondiste)"
+    await update.message.reply_html(
+        f"📣 <b>Confirmar envío masivo</b> a {recipients} usuarios:{preview}\n\n"
+        "Los usuarios que nunca abrieron el bot en privado o lo bloquearon no lo recibirán.",
+        reply_markup=keyboard)
+
+
+async def run_broadcast(bot_, admin_chat_id: int, payload: dict):
+    sent = failed = 0
+    for user_id in user_db.get_broadcast_user_ids():
+        try:
+            if "text" in payload:
+                await bot_.send_message(chat_id=user_id, text=payload["text"])
+            else:
+                await bot_.copy_message(chat_id=user_id, from_chat_id=payload["from_chat_id"],
+                                        message_id=payload["message_id"])
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(BROADCAST_DELAY_S)
+    try:
+        await bot_.send_message(chat_id=admin_chat_id,
+                                text=f"📣 Envío masivo terminado: ✅ {sent} entregados · ❌ {failed} fallidos.")
+    except Exception:
+        pass
+    return sent, failed
+
+
+async def handle_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_bot_admin(update):
+        await query.answer("Solo para administradores del bot.", show_alert=True)
+        return
+    payload = context.bot_data.get('broadcast_pending', {}).pop(update.effective_user.id, None)
+    await query.answer()
+    if query.data == "bc:cancel":
+        await query.edit_message_text("✖️ Envío masivo cancelado.")
+        return
+    if not payload:
+        await query.edit_message_text("⚠️ Este envío ya no está pendiente (¿ya se envió o el bot se reinició?).")
+        return
+    await query.edit_message_text("📣 Enviando en segundo plano; te aviso al terminar.")
+    # Background task: a long broadcast must not hold this update
+    context.application.create_task(run_broadcast(context.bot, update.effective_chat.id, payload))
 
 
 async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1030,6 +1257,7 @@ async def execute_download(
                 )
 
             user_db.record_download_success(user_id, platform, count_quota=False)
+            user_db.log_download(user_id, platform, ok=True, cached=True)
             user_db.add_history(user_id, url, format_type, platform, cached_title)
 
             if status_message:
@@ -1309,6 +1537,7 @@ async def execute_download(
                         thumb_fp.close()
 
         user_db.record_download_success(user_id, platform)
+        user_db.log_download(user_id, platform, ok=True)
         user_db.add_history(user_id, url, format_type, platform, title)
         await notify_low_quota(context, chat_id, user_id, user_mention)
 
@@ -1333,6 +1562,7 @@ async def execute_download(
 
     except ValueError as val_err:
         logger.warning(f"Download error for {url}: {val_err} | {getattr(val_err, 'detail', '')[:300]}")
+        user_db.log_download(user_id, platform, ok=False)
         # Content errors (private, deleted, too large...) won't change by retrying
         markup = None if getattr(val_err, 'content_error', False) else retry_button(url, format_type)
         try:
@@ -1346,6 +1576,7 @@ async def execute_download(
 
     except Exception as e:
         logger.error(f"Unexpected error downloading {url}: {e}", exc_info=True)
+        user_db.log_download(user_id, platform, ok=False)
         err_msg = (
             "❌ <b>Ocurrió un error al procesar el enlace.</b>\n"
             "Verifica que el video sea público y esté disponible."
@@ -1400,6 +1631,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_group=is_group,
             )
             return
+
+    if data.startswith("bc:"):
+        await handle_broadcast_callback(update, context)
+        return
 
     # 2. Cancel button on the "Descargando..." message (only cancels the presser's own downloads)
     if data == "cancel":
@@ -1607,6 +1842,9 @@ def main():
     # Global error handler
     app.add_error_handler(global_error_handler)
 
+    # Banned users are filtered before any other handler
+    app.add_handler(TypeHandler(Update, ban_gate), group=-1)
+
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler(["stats", "estadisticas", "perfil"], stats_command))
@@ -1620,6 +1858,12 @@ def main():
     app.add_handler(CommandHandler(["mp4", "video"], mp4_command))
     app.add_handler(CommandHandler(["cancel", "cancelar"], cancel_command))
     app.add_handler(CommandHandler(["historial", "history"], history_command))
+    app.add_handler(CommandHandler("estado", estado_command))
+    app.add_handler(CommandHandler("top", top_command))
+    app.add_handler(CommandHandler("viplist", viplist_command))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
