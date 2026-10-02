@@ -10,6 +10,11 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update,
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaAudio,
@@ -110,6 +115,47 @@ def format_filesize(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
+# --- Shared texts: single source for the rules so /start, /help, /panel and groups never disagree ---
+FREE_PLATFORMS_TEXT = "Instagram, TikTok, X y Facebook"
+VIP_PLATFORMS_TEXT = "todas las plataformas, incluidos YouTube (MP3/MP4) y Spotify"
+
+
+def rules_text() -> str:
+    return (
+        f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día en {FREE_PLATFORMS_TEXT}.\n"
+        f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día en {VIP_PLATFORMS_TEXT}.\n"
+        "• ⚡ Los enlaces que ya se descargaron antes se envían al instante y <b>no gastan cuota</b>."
+    )
+
+
+# (command, description, help text) — also used to build Telegram's "/" menu
+USER_COMMANDS = [
+    ("start", "Inicio y reglas del bot", "<code>/start</code> - Inicio y reglas del bot."),
+    ("help", "Guía de uso y comandos", "<code>/help</code> - Esta guía."),
+    ("stats", "Tus estadísticas y cuota diaria",
+     "<code>/stats</code> (<code>/perfil</code>) - Tus estadísticas y cuota diaria."),
+    ("mp3", "Descargar en audio MP3",
+     "<code>/mp3 [enlace]</code> (<code>/audio</code>, <code>/musica</code>) - Descarga en audio MP3. "
+     "También funciona respondiendo a un mensaje con enlace."),
+    ("mp4", "Descargar en video MP4",
+     "<code>/mp4 [enlace]</code> (<code>/video</code>) - Descarga en video MP4."),
+    ("panel", "Añadir el bot a un grupo", "<code>/panel</code> (<code>/grupo</code>) - Añadir el bot a un grupo."),
+    ("about", "Acerca del bot", "<code>/about</code> - Información del bot."),
+]
+GROUP_ADMIN_COMMANDS = [
+    ("vip", "Dar VIP (responde al usuario)",
+     "<code>/vip</code> - Responde a un usuario (o usa <code>/vip [id]</code>) para darle VIP."),
+    ("unvip", "Quitar VIP (responde al usuario)", "<code>/unvip</code> - Quita el VIP del mismo modo."),
+]
+BOT_ADMIN_COMMANDS = [
+    ("diag", "Diagnóstico de red y estrategias", "<code>/diag</code> - Diagnóstico de red y estrategias."),
+]
+
+
+def commands_help(commands) -> str:
+    return "\n".join(f"• {line}" for _, _, line in commands)
+
+
 async def schedule_midnight_quota_reset():
     """Background loop that resets all user daily quotas exactly at 12:00 AM (midnight) local time."""
     import datetime as dt
@@ -139,11 +185,36 @@ async def schedule_midnight_quota_reset():
                 break
 
 
+async def register_command_menus(application: Application) -> None:
+    """Publishes the "/" command menu: users everywhere, VIP tools for group admins, /diag for bot admins."""
+    def to_bot_commands(commands):
+        return [BotCommand(name, desc) for name, desc, _ in commands]
+
+    try:
+        await application.bot.set_my_commands(to_bot_commands(USER_COMMANDS),
+                                              scope=BotCommandScopeAllPrivateChats())
+        await application.bot.set_my_commands(to_bot_commands(USER_COMMANDS),
+                                              scope=BotCommandScopeAllGroupChats())
+        await application.bot.set_my_commands(to_bot_commands(USER_COMMANDS + GROUP_ADMIN_COMMANDS),
+                                              scope=BotCommandScopeAllChatAdministrators())
+        for admin_id in ADMIN_IDS:
+            try:
+                await application.bot.set_my_commands(
+                    to_bot_commands(USER_COMMANDS + GROUP_ADMIN_COMMANDS + BOT_ADMIN_COMMANDS),
+                    scope=BotCommandScopeChat(chat_id=admin_id))
+            except BadRequest as e:
+                # Fails until the admin has opened a private chat with the bot
+                logger.info(f"No se pudo fijar el menú de admin para {admin_id}: {e}")
+    except Exception as e:
+        logger.warning(f"No se pudo registrar el menú de comandos: {e}")
+
+
 async def post_init(application: Application) -> None:
     """Called after application initializes to fetch bot username and start background scheduler."""
     bot_info = await application.bot.get_me()
     application.bot_data['username'] = bot_info.username
     logger.info(f"Bot iniciado exitosamente como @{bot_info.username}")
+    await register_command_menus(application)
     task = asyncio.create_task(schedule_midnight_quota_reset())
     application.bot_data['quota_reset_task'] = task
 
@@ -313,7 +384,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start command."""
     user = update.effective_user
     chat = update.effective_chat
-    name = html.escape(user.first_name) if user and user.first_name else "amigo"
     bot_username = await get_bot_username(context)
 
     user_db.get_or_create_user(user.id, user.username, user.first_name)
@@ -325,8 +395,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(
             f"👋 ¡Hola a todos! Soy el bot descargador de videos y música.\n\n"
             "✨ <b>Condiciones del Grupo:</b>\n"
-            f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas diarias (X, Instagram, TikTok).\n"
-            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas diarias (Todas las plataformas: YouTube, Facebook, Spotify, etc.).\n\n"
+            f"{rules_text()}\n\n"
             "🧹 <i>Con permisos de Administrador (Eliminar mensajes), borro los enlaces automáticamente.</i>",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -334,19 +403,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
 
-    welcome_text = (
-        f"👋 ¡Hola, <b>{name}</b>!\n\n"
-        "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b> y arquitectura <b>Zero-Cookies</b>.\n\n"
-        "✨ <b>Niveles de Membresía:</b>\n"
-        f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas al día (Instagram, TikTok, X).\n"
-        f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas al día (Todas las plataformas: YouTube MP3/MP4, Spotify, Facebook, etc.).\n\n"
-        "📊 Usa <code>/stats</code> para ver tu consumo diario y estado.\n\n"
-        "📥 <b>¿Cómo usarlo?</b> Envíame cualquier enlace para comenzar."
+    await update.message.reply_html(
+        welcome_text(user),
+        reply_markup=get_start_keyboard(bot_username)
     )
 
-    await update.message.reply_html(
-        welcome_text,
-        reply_markup=get_start_keyboard(bot_username)
+
+def welcome_text(user) -> str:
+    name = html.escape(user.first_name) if user and user.first_name else "amigo"
+    return (
+        f"👋 ¡Hola, <b>{name}</b>!\n\n"
+        "Soy tu bot para descargar videos, fotos y música con sistema de membresías <b>VIP</b>.\n\n"
+        "✨ <b>Niveles de Membresía:</b>\n"
+        f"{rules_text()}\n\n"
+        "📊 Usa <code>/stats</code> para ver tu consumo diario y estado.\n\n"
+        "📥 <b>¿Cómo usarlo?</b> Envíame cualquier enlace para comenzar."
     )
 
 
@@ -385,8 +456,7 @@ async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👥 <b>PANEL DE GESTIÓN PARA GRUPOS</b>\n\n"
         "Añade este bot a cualquier grupo para activar el sistema de descargas con soporte VIP.\n\n"
         "⚡ <b>Condiciones Oficiales:</b>\n"
-        f"• 🆓 <b>NO VIP PASS:</b> Límite de {NO_VIP_DAILY_LIMIT} descargas diarias (X, Instagram, TikTok).\n"
-        f"• 👑 <b>VIP:</b> Límite de {VIP_DAILY_LIMIT} descargas diarias (YouTube, Facebook, X, IG, TikTok, Spotify).\n"
+        f"{rules_text()}\n"
         "• <b>Detección automática:</b> Los miembros con título '- VIP' en el grupo son reconocidos automáticamente.\n"
         "• <b>Limpieza de chat:</b> Elimina el mensaje del link una vez enviado el archivo."
     )
@@ -409,16 +479,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /help command."""
     help_text = (
         "📖 <b>Guía de Uso & Límites del Bot:</b>\n\n"
-        "1️⃣ Copia el enlace del video o audio que deseas.\n"
-        "2️⃣ Envíalo al chat privado o en el grupo.\n\n"
+        "1️⃣ Copia el enlace del video, foto o audio que deseas.\n"
+        "2️⃣ Envíalo al chat privado o en el grupo.\n"
+        "3️⃣ En YouTube elegirás entre MP3 y MP4.\n\n"
         "📋 <b>Reglas de Acceso (Privado y Grupos):</b>\n"
-        f"• <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día en <b>X, Instagram, TikTok y Facebook</b>.\n"
-        f"• <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día en <b>todas las plataformas</b> (YouTube MP3/MP4, Spotify, etc.).\n\n"
-        "💡 <b>Comandos disponibles:</b>\n"
-        "• <code>/stats</code> - Muestra tus estadísticas y cuota diaria.\n"
-        "• <code>/mp3 [enlace]</code> - Descarga directa en audio MP3.\n"
-        "• <code>/mp4 [enlace]</code> - Descarga directa en video MP4.\n"
-        "• <code>/panel</code> - Panel para añadir a grupos."
+        f"{rules_text()}\n\n"
+        "💡 <b>Comandos:</b>\n"
+        f"{commands_help(USER_COMMANDS)}\n\n"
+        "👥 <b>En grupos:</b> el bot detecta los enlaces solo y, si es administrador, "
+        "borra el mensaje con el enlace una vez enviado el archivo.\n"
+        "👮 <b>Admins del grupo:</b>\n"
+        f"{commands_help(GROUP_ADMIN_COMMANDS)}"
     )
 
     keyboard = [
@@ -443,10 +514,12 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /about command."""
     about_text = (
         "ℹ️ <b>Acerca de este Bot:</b>\n\n"
-        "🤖 <b>Versión:</b> 4.0.0 (Zero-Cookies & Anti-Bloqueo Render)\n"
-        "⚡ <b>Motor:</b> TikWM + FxTwitter + Polaris GraphQL + Mutagen + yt-dlp\n"
-        "🗄️ <b>Base de Datos:</b> SQLite para Usuarios, Cuotas y Caché instantánea\n"
-        "🧹 <b>Auto-Limpieza:</b> Borra links en grupos y mantiene el chat ordenado."
+        "🤖 <b>Versión:</b> 4.1.0 (Zero-Cookies)\n"
+        "🔒 <b>Privacidad:</b> descarga solo contenido público, sin cuentas ni cookies propias.\n"
+        "⚡ <b>Motor:</b> yt-dlp + TikWM + FxTwitter + Polaris GraphQL + igexport + Cobalt\n"
+        "🌐 <b>Red:</b> varias rutas de salida (directa, IPv6, Cloudflare WARP) con reintento automático\n"
+        "🗄️ <b>Base de Datos:</b> SQLite para usuarios, cuotas y caché instantánea\n"
+        "🧹 <b>Auto-Limpieza:</b> borra los enlaces en grupos y mantiene el chat ordenado."
     )
 
     keyboard = [
@@ -564,11 +637,42 @@ async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_html(
                 "🎉 <b>¡Hola! Gracias por añadirme a este grupo.</b>\n\n"
                 "📹 Descargaré videos y música automáticamente.\n\n"
-                f"💎 <b>Sistema VIP:</b> Los miembros con título '- VIP' en el grupo tienen {VIP_DAILY_LIMIT} descargas diarias y acceso a YouTube/Facebook. "
-                f"Los miembros estándar tienen {NO_VIP_DAILY_LIMIT} descargas diarias en Instagram, TikTok y X.\n\n"
+                "💎 <b>Sistema VIP</b> (los miembros con título '- VIP' en el grupo son VIP):\n"
+                f"{rules_text()}\n\n"
                 "💡 Hazme administrador con permiso de <b>'Eliminar mensajes'</b> para activar la auto-limpieza."
             )
             break
+
+
+LOW_QUOTA_THRESHOLD = 2
+
+
+def daily_limit_text(user_data) -> str:
+    max_daily = VIP_DAILY_LIMIT if user_data.get('is_vip') else NO_VIP_DAILY_LIMIT
+    return (
+        f"📉 <b>Límite diario alcanzado ({max_daily}/{max_daily})</b>\n\n"
+        f"Has utilizado tus <b>{max_daily} descargas diarias</b> de hoy.\n"
+        "Tu cuota se reiniciará automáticamente a la medianoche (00:00).\n"
+        "⚡ Los enlaces que ya se descargaron antes siguen funcionando."
+    )
+
+
+async def notify_low_quota(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, user_mention: str):
+    """Warns the user when only a few downloads are left for today."""
+    used, max_daily = user_db.get_quota(user_id)
+    remaining = max_daily - used
+    if remaining > LOW_QUOTA_THRESHOLD:
+        return
+    if remaining <= 0:
+        text = (f"📉 {user_mention}, has usado tus <b>{max_daily}</b> descargas de hoy. "
+                "Se reinician a medianoche (00:00). Los enlaces ya descargados antes siguen funcionando.")
+    else:
+        plural = "descarga" if remaining == 1 else "descargas"
+        text = f"⚠️ {user_mention}, te quedan <b>{remaining}</b> {plural} hoy ({used}/{max_daily})."
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.info(f"No se pudo enviar el aviso de cuota: {e}")
 
 
 async def execute_download(
@@ -598,9 +702,11 @@ async def execute_download(
         url = normalize_instagram_url(url)
     clean_url = html.escape(url)
 
-    # 1. Quota & Permission Verification
+    # 1. Quota & Permission Verification (cached links don't spend quota, so the daily limit doesn't block them)
+    cache_key = extract_youtube_id(url) if is_yt else url
+    cached_data = cache.get(cache_key, format_type)
     allowed, reason, user_data = user_db.check_download_permission(user_id, platform)
-    if not allowed:
+    if not allowed and not (reason == "daily_limit_reached" and cached_data):
         if status_message:
             try:
                 await status_message.delete()
@@ -611,29 +717,18 @@ async def execute_download(
             deny_text = (
                 "🔒 <b>Función Exclusiva VIP</b>\n\n"
                 "Tu estado actual es <b>NO VIP PASS</b>.\n"
-                "Plataformas permitidas para tu rango:\n"
-                "• 🐦 <b>X (Twitter)</b>\n"
-                "• 📸 <b>Instagram</b>\n"
-                "• 🎵 <b>TikTok</b>\n"
-                "• 👥 <b>Facebook</b>\n\n"
+                f"Plataformas permitidas para tu rango: <b>{FREE_PLATFORMS_TEXT}</b>.\n\n"
                 f"Para descargar de <b>{platform}</b>, solicita tu rango VIP a un administrador del grupo."
             )
             await context.bot.send_message(chat_id=chat_id, text=deny_text, parse_mode=ParseMode.HTML)
             return
 
         elif reason == "daily_limit_reached":
-            max_daily = VIP_DAILY_LIMIT if user_data.get('is_vip') else NO_VIP_DAILY_LIMIT
-            limit_text = (
-                f"📉 <b>Límite diario alcanzado ({max_daily}/{max_daily})</b>\n\n"
-                f"Has utilizado tus <b>{max_daily} descargas diarias</b> de hoy.\n"
-                "Tu cuota se reiniciará automáticamente a la medianoche (00:00)."
-            )
-            await context.bot.send_message(chat_id=chat_id, text=limit_text, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id=chat_id, text=daily_limit_text(user_data),
+                                           parse_mode=ParseMode.HTML)
             return
 
-    # 2. Check cache for instant delivery (<0.5s)
-    cache_key = extract_youtube_id(url) if is_yt else url
-    cached_data = cache.get(cache_key, format_type)
+    # 2. Cache hit: instant delivery (<0.5s)
     if cached_data:
         try:
             cached_title = cached_data.get('title', 'Media')
@@ -696,7 +791,7 @@ async def execute_download(
                     supports_streaming=True,
                 )
 
-            user_db.record_download_success(user_id, platform)
+            user_db.record_download_success(user_id, platform, count_quota=False)
 
             if status_message:
                 try:
@@ -713,6 +808,11 @@ async def execute_download(
             return
         except Exception as e:
             logger.info(f"Cached delivery failed, downloading fresh: {e}")
+            if not allowed:
+                # Only the cache hit let this user past the daily limit
+                await context.bot.send_message(chat_id=chat_id, text=daily_limit_text(user_data),
+                                               parse_mode=ParseMode.HTML)
+                return
 
     # 3. Fresh download
     item_label = "audio MP3" if is_audio else "contenido"
@@ -959,6 +1059,7 @@ async def execute_download(
                         thumb_fp.close()
 
         user_db.record_download_success(user_id, platform)
+        await notify_low_quota(context, chat_id, user_id, user_mention)
 
         try:
             await status_message.delete()
@@ -1046,18 +1147,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Menu navigation
     if data == "main_menu":
-        name = html.escape(user.first_name) if user and user.first_name else "amigo"
-        welcome_text = (
-            f"👋 ¡Hola, <b>{name}</b>!\n\n"
-            "Soy tu bot para descargar videos y música con sistema de membresías <b>VIP</b> y arquitectura <b>Zero-Cookies</b>.\n\n"
-            "✨ <b>Niveles de Membresía:</b>\n"
-            f"• 🆓 <b>NO VIP PASS:</b> {NO_VIP_DAILY_LIMIT} descargas/día (Instagram, TikTok, X, Facebook).\n"
-            f"• 👑 <b>VIP:</b> {VIP_DAILY_LIMIT} descargas/día (YouTube MP3/MP4, Spotify, etc.).\n\n"
-            "📥 Envíame cualquier enlace para comenzar."
-        )
         await query.answer()
         await query.edit_message_text(
-            welcome_text,
+            welcome_text(user),
             reply_markup=get_start_keyboard(bot_username),
             parse_mode=ParseMode.HTML
         )
@@ -1080,10 +1172,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "group_commands":
         cmd_text = (
             "📖 <b>COMANDOS PARA GRUPOS</b>\n\n"
-            "• <code>/stats</code> - Consulta tus estadísticas y cuota.\n"
-            "• <code>/mp3 [enlace]</code> - Descarga directa en MP3.\n"
-            "• <code>/mp4 [enlace]</code> - Descarga directa en MP4.\n"
-            "• <code>/panel</code> - Panel para añadir a grupos."
+            f"{commands_help(USER_COMMANDS)}\n\n"
+            "👮 <b>Solo administradores del grupo:</b>\n"
+            f"{commands_help(GROUP_ADMIN_COMMANDS)}"
         )
         keyboard = [[InlineKeyboardButton("◀️ Volver al Panel", callback_data="group_panel")]]
         await query.answer()

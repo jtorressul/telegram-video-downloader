@@ -162,7 +162,7 @@ class UserDatabase:
         if user.get('last_download_date') != today_str:
             daily_used = 0
 
-        # 1. Platform check: NO VIP only allowed X, Instagram, TikTok
+        # 1. Platform check: NO VIP only allowed SOCIAL_PLATFORMS
         if not is_vip and platform not in SOCIAL_PLATFORMS:
             return False, "platform_restricted", user
 
@@ -173,8 +173,8 @@ class UserDatabase:
 
         return True, "ok", user
 
-    def record_download_success(self, user_id: int, platform: str):
-        """Increments download stats and daily quota."""
+    def record_download_success(self, user_id: int, platform: str, count_quota: bool = True):
+        """Increments download stats and, unless count_quota is False (cache hits), the daily quota."""
         today_str = get_local_today_str()
         is_social = 1 if platform in SOCIAL_PLATFORMS else 0
 
@@ -195,11 +195,17 @@ class UserDatabase:
             """, (
                 1 if is_social else 0,
                 0 if is_social else 1,
-                daily_used + 1,
+                daily_used + (1 if count_quota else 0),
                 today_str,
                 user_id
             ))
             conn.commit()
+
+    def get_quota(self, user_id: int) -> Tuple[int, int]:
+        """Returns (used_today, daily_limit) for the user."""
+        user = self.get_or_create_user(user_id)
+        max_daily = VIP_DAILY_LIMIT if user.get('is_vip') else NO_VIP_DAILY_LIMIT
+        return user.get('daily_downloads', 0), max_daily
 
     def get_stats_message(self, user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> str:
         """Generates formatted user statistics card."""
