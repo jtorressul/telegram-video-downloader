@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import logging
+import time
 from datetime import datetime, date
 from typing import Optional, Dict, Any, Tuple
 
@@ -61,6 +62,11 @@ class UserDatabase:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            try:
+                # Unix time of the last VIP verification against the groups
+                conn.execute("ALTER TABLE users ADD COLUMN vip_checked_at REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS known_groups (
                     group_id INTEGER PRIMARY KEY,
@@ -143,11 +149,16 @@ class UserDatabase:
             return dict(row)
 
     def set_vip_status(self, user_id: int, is_vip: bool, username: Optional[str] = None, first_name: Optional[str] = None):
-        """Sets VIP status (1 or 0) for a user, ensuring the user exists first."""
+        """Sets VIP status (1 or 0) for a user and stamps the verification time."""
         self.get_or_create_user(user_id, username, first_name)
         with self._get_connection() as conn:
-            conn.execute("UPDATE users SET is_vip = ? WHERE user_id = ?", (1 if is_vip else 0, user_id))
+            conn.execute("UPDATE users SET is_vip = ?, vip_checked_at = ? WHERE user_id = ?",
+                         (1 if is_vip else 0, time.time(), user_id))
             conn.commit()
+
+    def get_vip_user_ids(self) -> list:
+        with self._get_connection() as conn:
+            return [row[0] for row in conn.execute("SELECT user_id FROM users WHERE is_vip = 1")]
 
     def check_download_permission(self, user_id: int, platform: str) -> Tuple[bool, str, Dict[str, Any]]:
         """

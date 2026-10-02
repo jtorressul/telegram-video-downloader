@@ -4,6 +4,8 @@ import html
 import asyncio
 import logging
 import threading
+import time
+import types
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from dotenv import load_dotenv
@@ -143,8 +145,9 @@ USER_COMMANDS = [
     ("about", "Acerca del bot", "<code>/about</code> - Información del bot."),
 ]
 GROUP_ADMIN_COMMANDS = [
-    ("vip", "Dar VIP (responde al usuario)",
-     "<code>/vip</code> - Responde a un usuario (o usa <code>/vip [id]</code>) para darle VIP."),
+    ("vip", "Dar VIP temporal (responde al usuario)",
+     "<code>/vip</code> - Responde a un usuario (o usa <code>/vip [id]</code>) para darle VIP temporal. "
+     "El VIP permanente se da poniéndole el título <b>'- VIP'</b> en el grupo."),
     ("unvip", "Quitar VIP (responde al usuario)", "<code>/unvip</code> - Quita el VIP del mismo modo."),
 ]
 BOT_ADMIN_COMMANDS = [
@@ -217,17 +220,19 @@ async def post_init(application: Application) -> None:
     await register_command_menus(application)
     task = asyncio.create_task(schedule_midnight_quota_reset())
     application.bot_data['quota_reset_task'] = task
+    application.bot_data['vip_audit_task'] = asyncio.create_task(schedule_vip_audit(application))
 
 
 async def post_shutdown(application: Application) -> None:
     """Cleanly cancel and await background tasks when stopping."""
-    task = application.bot_data.get('quota_reset_task')
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for key in ('quota_reset_task', 'vip_audit_task'):
+        task = application.bot_data.get(key)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -244,6 +249,45 @@ async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
     return username or ""
 
 
+# A VIP verified less than this ago is trusted without asking Telegram again
+VIP_RECHECK_SECONDS = 6 * 3600
+
+
+async def is_vip_in_group(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> Optional[bool]:
+    """
+    VIP rule for one group: creator, administrator, or custom title containing 'VIP' / 'ADMIN'.
+    Returns None when Telegram can't answer (bot removed, network error): callers must not
+    revoke VIP on an unknown result.
+    """
+    try:
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+    except Exception as e:
+        logger.info(f"No se pudo verificar VIP de {user_id} en {chat_id}: {e}")
+        return None
+    status = str(getattr(member, 'status', '')).lower()
+    if status in ('creator', 'owner', ChatMemberStatus.OWNER, 'administrator', ChatMemberStatus.ADMINISTRATOR):
+        return True
+    custom_title = (getattr(member, 'custom_title', '') or '').strip().upper()
+    # Members who left or were kicked keep no title, so they fall through to False
+    return 'VIP' in custom_title or 'ADMIN' in custom_title
+
+
+async def resolve_vip(context: ContextTypes.DEFAULT_TYPE, user_id: int, group_ids) -> Optional[bool]:
+    """VIP if VIP in ANY group. None if no group said yes and at least one couldn't be checked."""
+    unknown = False
+    for gid in group_ids:
+        result = await is_vip_in_group(context, gid, user_id)
+        if result:
+            return True
+        if result is None:
+            unknown = True
+    return None if unknown else False
+
+
+def _vip_check_is_fresh(user: dict) -> bool:
+    return time.time() - (user.get('vip_checked_at') or 0) < VIP_RECHECK_SECONDS
+
+
 async def sync_user_vip_status(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -252,14 +296,7 @@ async def sync_user_vip_status(
     first_name: Optional[str] = None,
     group_title: Optional[str] = None
 ) -> bool:
-    """
-    Checks member status/custom title in group.
-    - If user is in ADMIN_IDS -> VIP
-    - If user is Creator / Owner of the group -> VIP
-    - If user custom_title contains 'VIP' (e.g. 'DROGUITA - VIP', 'ALFREDO PC - VIP') -> VIP
-    - If user is Administrator with title 'ADMIN' or is Group Admin -> VIP
-    - If regular member without VIP title -> NO VIP PASS
-    """
+    """Updates VIP when the user writes in a group. Being VIP in another known group also counts."""
     if chat_id < 0:
         user_db.register_group(chat_id, group_title)
 
@@ -267,22 +304,26 @@ async def sync_user_vip_status(
         user_db.set_vip_status(user_id, True, username, first_name)
         return True
 
-    try:
-        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        status = str(getattr(member, 'status', '')).lower()
-        is_creator = status in ['creator', 'owner', ChatMemberStatus.OWNER]
-        is_admin = status in ['administrator', ChatMemberStatus.ADMINISTRATOR]
-        custom_title = (getattr(member, 'custom_title', '') or '').strip().upper()
+    user = user_db.get_or_create_user(user_id, username, first_name)
+    here = await is_vip_in_group(context, chat_id, user_id)
+    if here:
+        user_db.set_vip_status(user_id, True, username, first_name)
+        return True
+    if here is None:
+        return bool(user.get('is_vip'))
 
-        if is_creator or 'VIP' in custom_title or 'ADMIN' in custom_title or is_admin:
-            user_db.set_vip_status(user_id, True, username, first_name)
+    # Not VIP in this group: a recent VIP verification may come from another group
+    if user.get('is_vip'):
+        if _vip_check_is_fresh(user):
             return True
-        else:
-            user_db.set_vip_status(user_id, False, username, first_name)
-            return False
-    except Exception as e:
-        logger.warning(f"No se pudo verificar estado VIP de {user_id} en chat {chat_id}: {e}")
-        user_db.get_or_create_user(user_id, username, first_name)
+        others = [g for g in user_db.get_known_groups() if g != chat_id]
+        elsewhere = await resolve_vip(context, user_id, others)
+        if elsewhere is None:
+            return True
+        user_db.set_vip_status(user_id, elsewhere, username, first_name)
+        return elsewhere
+
+    user_db.set_vip_status(user_id, False, username, first_name)
     return False
 
 
@@ -292,24 +333,68 @@ async def sync_user_vip_from_all_groups(
     username: Optional[str] = None,
     first_name: Optional[str] = None
 ) -> bool:
-    """Checks VIP status across all known groups when in private chat."""
+    """Private chat: re-verifies across known groups unless the last check is recent."""
     if user_id in ADMIN_IDS:
         user_db.set_vip_status(user_id, True, username, first_name)
         return True
 
     user = user_db.get_or_create_user(user_id, username, first_name)
-    if user.get('is_vip'):
+    was_vip = bool(user.get('is_vip'))
+    if was_vip and _vip_check_is_fresh(user):
         return True
 
-    known_groups = user_db.get_known_groups()
-    for gid in known_groups:
-        try:
-            is_vip = await sync_user_vip_status(context, gid, user_id, username, first_name)
-            if is_vip:
-                return True
-        except Exception:
+    is_vip = await resolve_vip(context, user_id, user_db.get_known_groups())
+    if is_vip is None:
+        return was_vip
+    if is_vip or was_vip:
+        user_db.set_vip_status(user_id, is_vip, username, first_name)
+    return is_vip
+
+
+async def audit_vip_users(application: Application) -> int:
+    """Re-verifies every VIP against the groups and revokes those without a VIP title anywhere."""
+    revoked = 0
+    groups = user_db.get_known_groups()
+    ctx = types.SimpleNamespace(bot=application.bot)
+    for user_id in user_db.get_vip_user_ids():
+        if user_id in ADMIN_IDS:
             continue
-    return False
+        is_vip = await resolve_vip(ctx, user_id, groups)
+        await asyncio.sleep(0.2)  # stay far below Telegram's API limits
+        if is_vip is None:
+            continue
+        user_db.set_vip_status(user_id, is_vip)
+        if not is_vip:
+            revoked += 1
+            try:
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=("ℹ️ Tu estado <b>VIP</b> ha terminado porque ya no tienes el título "
+                          "'- VIP' en ningún grupo del bot. Ahora tienes <b>NO VIP PASS</b>.\n"
+                          f"Pide a un administrador que te lo vuelva a asignar para recuperar "
+                          f"{VIP_PLATFORMS_TEXT}."),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass  # user never opened a private chat with the bot or blocked it
+    return revoked
+
+
+async def schedule_vip_audit(application: Application):
+    """Runs the VIP audit once a day (first run shortly after start)."""
+    await asyncio.sleep(300)
+    while True:
+        try:
+            revoked = await audit_vip_users(application)
+            logger.info(f"✅ Auditoría VIP diaria completada: {revoked} VIP retirados.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error en la auditoría VIP: {e}", exc_info=True)
+        try:
+            await asyncio.sleep(24 * 3600)
+        except asyncio.CancelledError:
+            break
 
 
 async def keep_chat_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: ChatAction, stop_event: asyncio.Event):
@@ -572,7 +657,10 @@ async def vip_management_command(update: Update, context: ContextTypes.DEFAULT_T
 
     user_db.set_vip_status(target_id, make_vip)
     estado_str = "<b>VIP</b> 👑" if make_vip else "<b>NO VIP PASS</b> 🆓"
-    await update.message.reply_html(f"✅ El usuario <code>{target_id}</code> ahora tiene estado: {estado_str}.")
+    note = ("\n\nℹ️ El VIP se verifica con el título del grupo: si no tiene el título <b>'- VIP'</b>, "
+            "lo perderá en la próxima verificación (unas horas).") if make_vip else ""
+    await update.message.reply_html(
+        f"✅ El usuario <code>{target_id}</code> ahora tiene estado: {estado_str}.{note}")
 
 
 async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
