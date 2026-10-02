@@ -9,7 +9,8 @@ from downloaders.base import Strategy, run_chain
 from downloaders.common import detect_platform, extract_youtube_id
 from downloaders.errors import (IPBlocked, NotFound, Private, RateLimited, RegionOrAgeLocked, Unknown,
                                 classify)
-from downloaders.instagram import extract_instagram_shortcode, normalize_instagram_url, parse_embed_html
+from downloaders.instagram import (extract_instagram_shortcode, media_from_igexport, normalize_instagram_url,
+                                  parse_embed_html)
 from downloaders.net import DIRECT, Route, random_ipv6
 from downloaders.spotify import parse_embed_page, score_candidate
 from downloaders.twitter import parse_tweet_url, syndication_token
@@ -202,6 +203,19 @@ def test_instagram_embed_parser_fallback_regex():
 
 def test_instagram_embed_parser_no_media():
     assert parse_embed_html("<html>nothing</html>") is None
+
+
+def test_igexport_parser():
+    data = {"ok": True, "media": {"shortcode": "X", "items": [
+        {"type": "video", "url": "https://cdn.example/v.mp4", "thumbnailUrl": "https://cdn.example/t.jpg"},
+        {"type": "image", "url": "https://cdn.example/p.jpg"},
+        {"type": "video"},
+    ]}}
+    assert media_from_igexport(data) == [
+        {"type": "video", "url": "https://cdn.example/v.mp4", "thumbnail_url": "https://cdn.example/t.jpg"},
+        {"type": "photo", "url": "https://cdn.example/p.jpg", "thumbnail_url": None},
+    ]
+    assert media_from_igexport({"ok": False}) == []
 
 
 @pytest.mark.live

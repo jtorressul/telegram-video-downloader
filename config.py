@@ -51,6 +51,8 @@ if _cobalt_single and _cobalt_single not in _cobalt:
     _cobalt.insert(0, _cobalt_single)
 COBALT_INSTANCES = _cobalt
 COBALT_API_KEY = os.getenv("COBALT_API_KEY", "").strip()
+# API de igexport.com: obtiene reels +18 de Instagram desde SUS servidores; vacío = desactivado
+IGEXPORT_API = os.getenv("IGEXPORT_API", "https://igexport.com").strip().rstrip("/")
 
 # Endpoints compatibles con la API de TikWM (se prueban en orden)
 TIKTOK_APIS = _list("TIKTOK_APIS") or ["https://www.tikwm.com/api/", "https://tikwm.com/api/"]

@@ -1,4 +1,6 @@
-"""Instagram: Polaris GraphQL → embed page → yt-dlp → Cobalt → OpenGraph. All anonymous.
+"""Instagram: embed page → Polaris GraphQL → igexport → yt-dlp → Cobalt → OpenGraph. All anonymous.
+
+igexport.com is a third-party API that fetches with its own sessions: the only path for +18 reels.
 
 instagrapi (account login) remains only as an opt-in strategy for ANONYMOUS_ONLY=false.
 Logging in from a datacenter IP is what got the service account suspended.
@@ -186,6 +188,35 @@ def _embed(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, 
     return _download(parsed['media'], format_type, workdir, sc, parsed['caption'], parsed['author'], route)
 
 
+def media_from_igexport(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """igexport /api/ig-photo/ response → normalized media list."""
+    items = (data.get('media') or {}).get('items') or []
+    return [{'type': 'video' if i.get('type') == 'video' else 'photo', 'url': i.get('url'),
+             'thumbnail_url': i.get('thumbnailUrl')} for i in items if i.get('url')]
+
+
+def _igexport_enabled() -> bool:
+    return bool(config.IGEXPORT_API)
+
+
+def _igexport(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, Any]:
+    """igexport.com fetches with its own sessions, so it also returns age-gated (+18) reels."""
+    sc = _shortcode(url)
+    with Http(timeout=40) as http:
+        resp = http.get(f"{config.IGEXPORT_API}/api/ig-photo/", params={'url': url}, check=False)
+    if resp.status_code >= 400:
+        # igexport answers 502 both for missing posts and for its own outages: let others decide
+        raise Unknown(f"igexport HTTP {resp.status_code}")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise Unknown(f"igexport respuesta no JSON: {resp.text[:120]}")
+    media = media_from_igexport(data)
+    if not data.get('ok') or not media:
+        raise Unknown(f"igexport sin medios: {str(data)[:150]}")
+    return _download(media, format_type, workdir, sc, None, None, route)
+
+
 def _ytdlp(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, Any]:
     return ydl_download(url, format_type, workdir, route, PLATFORM, EMOJI)
 
@@ -243,6 +274,7 @@ def _instagrapi(url: str, format_type: str, workdir: str, route: Route) -> Dict[
 STRATEGIES = [
     Strategy("ig-embed", _embed),
     Strategy("ig-polaris", _polaris),
+    Strategy("igexport", _igexport, route_sensitive=False, enabled=_igexport_enabled),
     Strategy("ytdlp-ig", _ytdlp),
     Strategy("cobalt-ig", _cobalt, route_sensitive=False, enabled=cobalt.enabled),
     Strategy("ig-opengraph", _opengraph),
