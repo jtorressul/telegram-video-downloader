@@ -48,7 +48,22 @@ def _shortcode(url: str) -> str:
     return sc
 
 
-def _download(media, format_type, workdir, sc, caption, author, route):
+_VIDEO_EXT_RE = re.compile(r'\.(?:mp4|m4v|mov|webm)(?:$|\?)', re.I)
+_IMAGE_EXT_RE = re.compile(r'\.(?:jpe?g|png|webp|heic|avif)(?:$|\?)', re.I)
+
+
+def _is_reel(url: str) -> bool:
+    return bool(re.search(r'/(?:reels?|tv|share/reel)/', url))
+
+
+def _download(media, format_type, workdir, url, caption, author, route):
+    """Downloads the media, refusing results that are just the cover image of a video."""
+    if not media:
+        raise Unknown("sin medios")
+    if _is_reel(url) and not any(m.get('type') in ('video', 'gif') for m in media):
+        # A reel is always a video: a photo here is its thumbnail, let another strategy try
+        raise Unknown("solo se obtuvo la miniatura del reel")
+    sc = _shortcode(url)
     with Http(route, timeout=60) as http:
         return download_media_list(http, media, format_type, workdir, f"ig_{sc}", PLATFORM, EMOJI,
                                    caption or "Publicación de Instagram", author or "Instagram",
@@ -63,7 +78,9 @@ def media_from_api_item(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     def one(node):
         imgs = (node.get('image_versions2') or {}).get('candidates') or []
         thumb = imgs[0].get('url') if imgs else None
-        if node.get('media_type') == 2 and node.get('video_versions'):
+        if node.get('media_type') == 2:
+            if not node.get('video_versions'):
+                return None  # video without playable URL: the image would only be its cover
             v = node['video_versions'][0]
             return {'type': 'video', 'url': v.get('url'), 'thumbnail_url': thumb,
                     'duration': node.get('video_duration'), 'width': v.get('width'), 'height': v.get('height')}
@@ -78,7 +95,9 @@ def media_from_api_item(item: Dict[str, Any]) -> List[Dict[str, Any]]:
 def media_from_graphql(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Public web GraphQL shortcode_media (GraphVideo / GraphImage / GraphSidecar) → media list."""
     def one(n):
-        if n.get('is_video') and n.get('video_url'):
+        if n.get('is_video'):
+            if not n.get('video_url'):
+                return None  # logged-out views often omit video_url: display_url is just the cover
             dims = n.get('dimensions') or {}
             return {'type': 'video', 'url': n['video_url'], 'thumbnail_url': n.get('display_url'),
                     'duration': n.get('video_duration'), 'width': dims.get('width'), 'height': dims.get('height')}
@@ -137,7 +156,7 @@ def _polaris(url: str, format_type: str, workdir: str, route: Route) -> Dict[str
         raise Unknown(f"Polaris sin datos: {str(data)[:150]}")
     caption = (item.get('caption') or {}).get('text')
     author = (item.get('user') or {}).get('username')
-    return _download(media_from_api_item(item), format_type, workdir, sc, caption, author, route)
+    return _download(media_from_api_item(item), format_type, workdir, url, caption, author, route)
 
 
 def parse_embed_html(page: str) -> Optional[Dict[str, Any]]:
@@ -192,36 +211,57 @@ def _embed(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, 
         raise Unknown("embed sin medios")
     if format_type == 'mp3' and not any(m['type'] == 'video' for m in parsed['media']):
         raise Unknown("embed sin video (puede ser un carrusel incompleto)")
-    return _download(parsed['media'], format_type, workdir, sc, parsed['caption'], parsed['author'], route)
+    return _download(parsed['media'], format_type, workdir, url, parsed['caption'], parsed['author'], route)
 
 
 def media_from_igexport(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """igexport /api/ig-photo/ response → normalized media list."""
-    items = (data.get('media') or {}).get('items') or []
-    return [{'type': 'video' if i.get('type') == 'video' else 'photo', 'url': i.get('url'),
-             'thumbnail_url': i.get('thumbnailUrl')} for i in items if i.get('url')]
+    """igexport /api/ig-photo/ response → normalized media list.
+
+    Its backends ("source") sometimes label a video item with the cover JPG as `url`: the file
+    extension wins over `type`, and a video without a video file is dropped."""
+    out = []
+    for i in (data.get('media') or {}).get('items') or []:
+        url = i.get('url')
+        if not url:
+            continue
+        hint = f"{url.split('?')[0]} {i.get('filename') or ''}"
+        is_video = bool(_VIDEO_EXT_RE.search(hint)) or (i.get('type') == 'video' and not _IMAGE_EXT_RE.search(hint))
+        if i.get('type') == 'video' and not is_video:
+            continue
+        out.append({'type': 'video' if is_video else 'photo', 'url': url, 'thumbnail_url': i.get('thumbnailUrl')})
+    return out
 
 
 def _igexport_enabled() -> bool:
     return bool(config.IGEXPORT_API)
 
 
+IGEXPORT_ATTEMPTS = 2
+
+
 def _igexport(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, Any]:
     """igexport.com fetches with its own sessions, so it also returns age-gated (+18) reels."""
-    sc = _shortcode(url)
-    with Http(timeout=40) as http:
-        resp = http.get(f"{config.IGEXPORT_API}/api/ig-photo/", params={'url': url}, check=False)
-    if resp.status_code >= 400:
-        # igexport answers 502 both for missing posts and for its own outages: let others decide
-        raise Unknown(f"igexport HTTP {resp.status_code}")
-    try:
-        data = resp.json()
-    except ValueError:
-        raise Unknown(f"igexport respuesta no JSON: {resp.text[:120]}")
-    media = media_from_igexport(data)
-    if not data.get('ok') or not media:
-        raise Unknown(f"igexport sin medios: {str(data)[:150]}")
-    return _download(media, format_type, workdir, sc, None, None, route)
+    _shortcode(url)
+    error = "igexport sin respuesta"
+    # igexport rotates backends ("source"): a rate limit or a reel without its video often
+    # succeeds on the next call
+    for attempt in range(IGEXPORT_ATTEMPTS):
+        if attempt:
+            time.sleep(2)
+        with Http(timeout=40) as http:
+            resp = http.get(f"{config.IGEXPORT_API}/api/ig-photo/", params={'url': url}, check=False)
+        if resp.status_code >= 400:
+            # igexport answers 502 both for missing posts and for its own outages: let others decide
+            raise Unknown(f"igexport HTTP {resp.status_code}")
+        try:
+            data = resp.json()
+        except ValueError:
+            raise Unknown(f"igexport respuesta no JSON: {resp.text[:120]}")
+        media = media_from_igexport(data)
+        if data.get('ok') and media and (not _is_reel(url) or any(m['type'] == 'video' for m in media)):
+            return _download(media, format_type, workdir, url, None, None, route)
+        error = f"igexport sin video: {str(data)[:150]}"
+    raise Unknown(error)
 
 
 IGEXPORT_PROBE_URL = "https://www.instagram.com/p/aye83DjauH/"  # old public post, stable for years
@@ -251,18 +291,33 @@ def _cobalt(url: str, format_type: str, workdir: str, route: Route) -> Dict[str,
 
 
 def _opengraph(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, Any]:
-    if format_type == 'mp3':
-        raise Unsupported("OpenGraph solo obtiene fotos")
-    sc = _shortcode(url)
+    _shortcode(url)
     with Http(route, timeout=15) as http:
         page = http.get(url).text
-    img = re.search(r'property="og:image"\s+content="([^"]+)"', page) or \
-        re.search(r'content="([^"]+)"\s+property="og:image"', page)
-    if not img:
-        raise Unknown("sin og:image")
-    title = re.search(r'property="og:title"\s+content="([^"]+)"', page)
-    return _download([{'type': 'photo', 'url': html.unescape(img.group(1))}], format_type, workdir, sc,
-                     html.unescape(title.group(1)) if title else None, None, route)
+    media = parse_opengraph(page)
+    if not media:
+        raise Unknown("sin og:video ni og:image")
+    if format_type == 'mp3' and media[0]['type'] != 'video':
+        raise Unsupported("OpenGraph no expone el video de esta publicación")
+    title = _og(page, 'og:title')
+    return _download(media, format_type, workdir, url, title, None, route)
+
+
+def _og(page: str, prop: str) -> Optional[str]:
+    m = re.search(rf'property="{prop}"\s+content="([^"]+)"', page) or \
+        re.search(rf'content="([^"]+)"\s+property="{prop}"', page)
+    return html.unescape(m.group(1)) if m else None
+
+
+def parse_opengraph(page: str) -> List[Dict[str, Any]]:
+    """Post page OpenGraph tags → media list. og:image of a video is only its cover, never a result."""
+    image = _og(page, 'og:image')
+    video = _og(page, 'og:video:secure_url') or _og(page, 'og:video')
+    if video:
+        return [{'type': 'video', 'url': video, 'thumbnail_url': image}]
+    if image and (_og(page, 'og:type') or '').startswith('video'):
+        return []
+    return [{'type': 'photo', 'url': image}] if image else []
 
 
 # --- Opt-in, login based (disabled while ANONYMOUS_ONLY=true) ---
@@ -293,7 +348,7 @@ def _instagrapi(url: str, format_type: str, workdir: str, route: Route) -> Dict[
     item = (raw.get('items') or [{}])[0]
     caption = (item.get('caption') or {}).get('text')
     author = (item.get('user') or {}).get('username')
-    return _download(media_from_api_item(item), format_type, workdir, _shortcode(url), caption, author, route)
+    return _download(media_from_api_item(item), format_type, workdir, url, caption, author, route)
 
 
 STRATEGIES = [

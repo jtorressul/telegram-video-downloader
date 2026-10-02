@@ -9,8 +9,10 @@ from downloaders.base import Strategy, run_chain
 from downloaders.common import detect_platform, extract_youtube_id
 from downloaders.errors import (IPBlocked, NotFound, Private, RateLimited, RegionOrAgeLocked, Unavailable,
                                 Unknown, classify)
-from downloaders.instagram import (extract_instagram_shortcode, media_from_igexport, normalize_instagram_url,
-                                  parse_embed_html)
+from downloaders import instagram
+from downloaders.instagram import (extract_instagram_shortcode, media_from_api_item, media_from_graphql,
+                                  media_from_igexport, normalize_instagram_url, parse_embed_html,
+                                  parse_opengraph)
 from downloaders.net import DIRECT, Route, random_ipv6
 from downloaders.spotify import parse_embed_page, score_candidate
 from downloaders.twitter import parse_tweet_url, syndication_token
@@ -223,6 +225,76 @@ def test_igexport_parser():
         {"type": "photo", "url": "https://cdn.example/p.jpg", "thumbnail_url": None},
     ]
     assert media_from_igexport({"ok": False}) == []
+
+
+def test_igexport_parser_drops_video_cover():
+    # Some igexport backends label a video with its cover JPG: that must never become a "photo"
+    data = {"ok": True, "media": {"items": [
+        {"type": "video", "url": "https://cdn.example/cover.jpg?x=1", "filename": "igexport-X.jpg"},
+        {"type": "image", "url": "https://cdn.example/o1/v/AQO.mp4?x=1", "filename": "igexport-X.mp4"},
+    ]}}
+    assert media_from_igexport(data) == [
+        {"type": "video", "url": "https://cdn.example/o1/v/AQO.mp4?x=1", "thumbnail_url": None},
+    ]
+
+
+def test_instagram_normalizers_skip_video_without_url():
+    assert media_from_graphql({"is_video": True, "display_url": "https://cdn.example/c.jpg"}) == []
+    assert media_from_api_item({"media_type": 2, "image_versions2": {"candidates": [{"url": "c.jpg"}]}}) == []
+
+
+def test_instagram_opengraph_prefers_video():
+    page = ('<meta property="og:type" content="video" />'
+            '<meta property="og:image" content="https://cdn.example/c.jpg" />'
+            '<meta property="og:video" content="https://cdn.example/v.mp4?a=1&amp;b=2" />')
+    assert parse_opengraph(page) == [{"type": "video", "url": "https://cdn.example/v.mp4?a=1&b=2",
+                                      "thumbnail_url": "https://cdn.example/c.jpg"}]
+    # Video post without og:video: the image is only the cover
+    assert parse_opengraph(page.split('<meta property="og:video"')[0]) == []
+    assert parse_opengraph('<meta property="og:image" content="https://cdn.example/p.jpg" />') == [
+        {"type": "photo", "url": "https://cdn.example/p.jpg"}]
+
+
+def test_instagram_reel_rejects_thumbnail_only(tmp_path):
+    with pytest.raises(Unknown):
+        instagram._download([{"type": "photo", "url": "https://cdn.example/c.jpg"}], "mp4", str(tmp_path),
+                            "https://www.instagram.com/reel/ABC/", None, None, DIRECT)
+
+
+def test_igexport_retries_when_reel_comes_without_video(monkeypatch, tmp_path):
+    responses = [
+        {"ok": False, "error": "rate_limited"},
+        {"ok": True, "media": {"items": [{"type": "video", "url": "https://cdn.example/v.mp4"}]}},
+    ]
+
+    class FakeResp:
+        status_code = 200
+
+        def __init__(self, data):
+            self.data = data
+
+        def json(self):
+            return self.data
+
+    class FakeHttp:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, *a, **k):
+            return FakeResp(responses.pop(0))
+
+    got = {}
+    monkeypatch.setattr(instagram, "Http", FakeHttp)
+    monkeypatch.setattr(instagram.time, "sleep", lambda s: None)
+    monkeypatch.setattr(instagram, "_download", lambda media, *a: got.setdefault("media", media))
+    instagram._igexport("https://www.instagram.com/reel/ABC/", "mp4", str(tmp_path), DIRECT)
+    assert got["media"][0]["type"] == "video" and not responses
 
 
 @pytest.mark.live
