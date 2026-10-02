@@ -60,6 +60,13 @@ class VideoCache:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Short numeric ids for URLs: Telegram button data is limited to 64 bytes
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS url_refs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL
+                )
+            """)
             try:
                 conn.execute("ALTER TABLE video_cache ADD COLUMN is_audio INTEGER DEFAULT 0")
             except Exception:
@@ -124,3 +131,15 @@ class VideoCache:
                 conn.commit()
         except Exception as e:
             logger.warning(f"Error saving to cache for {video_id_or_url}: {e}")
+
+    def url_ref(self, url: str) -> int:
+        """Returns a stable short id for url (for inline button callback data)."""
+        with self._get_connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO url_refs (url) VALUES (?)", (url,))
+            conn.commit()
+            return conn.execute("SELECT id FROM url_refs WHERE url = ?", (url,)).fetchone()[0]
+
+    def url_from_ref(self, ref: int) -> Optional[str]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT url FROM url_refs WHERE id = ?", (ref,)).fetchone()
+            return row[0] if row else None

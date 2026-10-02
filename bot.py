@@ -7,7 +7,7 @@ import threading
 import time
 import types
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional
+from typing import Dict, Optional, Set, Tuple
 from dotenv import load_dotenv
 
 from telegram import (
@@ -19,6 +19,10 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultCachedAudio,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultCachedVideo,
+    InlineQueryResultsButton,
     InputMediaAudio,
     InputMediaPhoto,
     InputMediaVideo,
@@ -33,6 +37,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     CallbackQueryHandler,
+    InlineQueryHandler,
     filters,
 )
 
@@ -47,6 +52,7 @@ from downloaders import (
     normalize_instagram_url,
 )
 from downloaders import health
+from downloaders.errors import Cancelled
 from downloaders.diag import run_diagnostics
 from cache import VideoCache
 from db import (
@@ -76,10 +82,54 @@ downloader = VideoDownloader()
 cache = VideoCache()
 user_db = UserDatabase()
 
-# Concurrency limiter (4 parallel downloads)
+# Concurrency limiter (4 parallel downloads; other updates keep flowing)
 download_semaphore = asyncio.Semaphore(4)
 
 URL_REGEX = re.compile(r'(https?://[^\s]+)')
+MAX_LINKS_PER_MESSAGE = 5
+
+# In-flight downloads per user, so /cancel and the ✖️ button can stop them
+active_downloads: Dict[int, Set[asyncio.Task]] = {}
+
+
+def canonical_url(url: str) -> Tuple[str, str]:
+    """Returns (url, cache_key) with the same normalization the cache uses."""
+    if is_youtube_url(url):
+        yt_id = extract_youtube_id(url)
+        if yt_id:
+            return f"https://www.youtube.com/watch?v={yt_id}", yt_id
+    elif detect_platform(url)[0] == "Instagram":
+        url = normalize_instagram_url(url)
+    return url, url
+
+
+def unique_urls(text: str) -> list:
+    seen, result = set(), []
+    for url in URL_REGEX.findall(text or ""):
+        key = canonical_url(url.strip())[0]
+        if key not in seen:
+            seen.add(key)
+            result.append(url.strip())
+    return result
+
+
+def audio_button(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Solo audio", callback_data=f"aud:{cache.url_ref(url)}")]])
+
+
+def retry_button(url: str, format_type: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔄 Reintentar", callback_data=f"retry:{format_type}:{cache.url_ref(url)}")]])
+
+
+CANCEL_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancelar", callback_data="cancel")]])
+
+
+def cancel_user_downloads(user_id: int) -> int:
+    tasks = [t for t in active_downloads.get(user_id, ()) if not t.done()]
+    for task in tasks:
+        task.cancel()
+    return len(tasks)
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -141,6 +191,10 @@ USER_COMMANDS = [
      "También funciona respondiendo a un mensaje con enlace."),
     ("mp4", "Descargar en video MP4",
      "<code>/mp4 [enlace]</code> (<code>/video</code>) - Descarga en video MP4."),
+    ("historial", "Tus últimas descargas",
+     "<code>/historial</code> - Tus últimas 10 descargas, con botones para recibirlas de nuevo."),
+    ("cancel", "Cancelar tu descarga en curso",
+     "<code>/cancel</code> (<code>/cancelar</code>) - Cancela tu descarga en curso."),
     ("panel", "Añadir el bot a un grupo", "<code>/panel</code> (<code>/grupo</code>) - Añadir el bot a un grupo."),
     ("about", "Acerca del bot", "<code>/about</code> - Información del bot."),
 ]
@@ -488,6 +542,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await sync_user_vip_from_all_groups(context, user.id, user.username, user.first_name)
 
+    # Deep link from inline mode: /start dl_<ref> downloads that link here
+    arg = context.args[0] if context.args else ""
+    if arg.startswith("dl_") and arg[3:].isdigit():
+        url = cache.url_from_ref(int(arg[3:]))
+        if url:
+            await download_links(update, context, [url])
+            return
+
     await update.message.reply_html(
         welcome_text(user),
         reply_markup=get_start_keyboard(bot_username)
@@ -562,11 +624,15 @@ async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /help command."""
+    bot_username = await get_bot_username(context)
+    inline_example = f"@{bot_username} enlace" if bot_username else "@bot enlace"
     help_text = (
         "📖 <b>Guía de Uso & Límites del Bot:</b>\n\n"
         "1️⃣ Copia el enlace del video, foto o audio que deseas.\n"
-        "2️⃣ Envíalo al chat privado o en el grupo.\n"
-        "3️⃣ En YouTube elegirás entre MP3 y MP4.\n\n"
+        f"2️⃣ Envíalo al chat privado o en el grupo (hasta {MAX_LINKS_PER_MESSAGE} enlaces por mensaje).\n"
+        "3️⃣ En YouTube elegirás entre MP3 y MP4; en otros videos tienes el botón 🎵 <b>Solo audio</b>.\n\n"
+        f"🔎 <b>Modo inline:</b> escribe <code>{inline_example}</code> en cualquier chat para "
+        "compartir al instante lo que ya se descargó antes.\n\n"
         "📋 <b>Reglas de Acceso (Privado y Grupos):</b>\n"
         f"{rules_text()}\n\n"
         "💡 <b>Comandos:</b>\n"
@@ -713,6 +779,91 @@ async def mp4_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await direct_format_command(update, context, "mp4")
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels the user's in-flight downloads."""
+    count = cancel_user_downloads(update.effective_user.id)
+    if count:
+        await update.message.reply_html(f"🛑 Cancelando {count} descarga{'s' if count > 1 else ''}...")
+    else:
+        await update.message.reply_html("ℹ️ No tienes descargas en curso.")
+
+
+HISTORY_SHOWN = 10
+FORMAT_ICONS = {"mp3": "🎵", "mp4": "🎬"}
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists the user's last downloads with buttons to get them again (instant from cache)."""
+    user = update.effective_user
+    items = user_db.get_history(user.id, HISTORY_SHOWN)
+    if not items:
+        await update.message.reply_html("📭 Aún no tienes descargas. Envíame un enlace para empezar.")
+        return
+
+    lines = ["🕘 <b>Tus últimas descargas</b>\n"]
+    buttons = []
+    for idx, item in enumerate(items, 1):
+        title = html.escape((item['title'] or "Sin título")[:60])
+        icon = FORMAT_ICONS.get(item['format'], "📥")
+        lines.append(f"{idx}. {icon} {title} — <i>{html.escape(item['platform'] or '')}</i>")
+        buttons.append(InlineKeyboardButton(
+            str(idx), callback_data=f"hist:{item['format']}:{cache.url_ref(item['url'])}"))
+    lines.append("\nPulsa un número para recibirlo de nuevo (no gasta cuota si sigue en caché).")
+    keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
+    await update.message.reply_html("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard),
+                                    disable_web_page_preview=True)
+
+
+def _inline_caption(cached: dict, url: str, emoji: str, bot_username: str) -> str:
+    title = html.escape((cached.get('title') or 'Media')[:200])
+    via = f"\n🤖 vía @{bot_username}" if bot_username else ""
+    return f"{emoji} <b>{title}</b>\n🔗 <a href=\"{html.escape(url)}\">Link original</a>{via}"
+
+
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """@bot <link>: sends cached media instantly; otherwise offers to download it in private."""
+    query = update.inline_query
+    urls = unique_urls(query.query)
+    if not urls:
+        await query.answer([], cache_time=60, button=InlineQueryResultsButton(
+            text="📥 Pega un enlace después de mi nombre", start_parameter="inline"))
+        return
+
+    url, cache_key = canonical_url(urls[0])
+    platform, emoji = detect_platform(url)
+    allowed, reason, _ = user_db.check_download_permission(query.from_user.id, platform)
+    if not allowed and reason == "platform_restricted":
+        await query.answer([], cache_time=10, is_personal=True, button=InlineQueryResultsButton(
+            text=f"🔒 {platform} es solo para VIP", start_parameter="vip"))
+        return
+
+    bot_username = await get_bot_username(context)
+    results = []
+    for fmt in ("mp4", "mp3"):
+        cached = cache.get(cache_key, fmt)
+        if not cached:
+            continue
+        caption = _inline_caption(cached, url, emoji, bot_username)
+        result_id = f"{fmt}-{cache.url_ref(url)}"
+        title = (cached.get('title') or platform)[:60]
+        if cached.get('media_type') == 'photo':
+            results.append(InlineQueryResultCachedPhoto(
+                id=result_id, photo_file_id=cached['file_id'], title=title,
+                caption=caption, parse_mode=ParseMode.HTML))
+        elif cached.get('media_type') == 'audio' or fmt == 'mp3':
+            results.append(InlineQueryResultCachedAudio(
+                id=result_id, audio_file_id=cached['file_id'], caption=caption, parse_mode=ParseMode.HTML))
+        else:
+            results.append(InlineQueryResultCachedVideo(
+                id=result_id, video_file_id=cached['file_id'], title=f"🎬 {title}",
+                caption=caption, parse_mode=ParseMode.HTML))
+
+    # Uncached links can't be downloaded within the inline answer timeout: hand off to the private chat
+    button_text = "📥 Otro formato en el bot" if results else f"📥 Descargar de {platform} en el bot"
+    await query.answer(results, cache_time=10, is_personal=True, button=InlineQueryResultsButton(
+        text=button_text, start_parameter=f"dl_{cache.url_ref(url)}"))
+
+
 async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greets the group when added and registers it."""
     chat = update.effective_chat
@@ -774,24 +925,22 @@ async def execute_download(
     original_message=None,
     is_group: bool = False
 ):
-    """Core download execution with quota checking, caching, and stats recording."""
+    """Core download execution with quota checking, caching, and stats recording.
+
+    Returns False when the user was denied (VIP-only platform or daily limit), True otherwise.
+    """
     platform, emoji = detect_platform(url)
-    is_yt = is_youtube_url(url)
     is_spotify = is_spotify_url(url)
     if is_spotify:
         format_type = "mp3"
     format_type = format_type.lower().strip()
     is_audio = (format_type == 'mp3')
-    if is_yt:
-        yt_id = extract_youtube_id(url)
-        if yt_id:
-            url = f"https://www.youtube.com/watch?v={yt_id}"
-    elif platform == "Instagram":
-        url = normalize_instagram_url(url)
+    url, cache_key = canonical_url(url)
     clean_url = html.escape(url)
+    # Offer "audio only" under videos, except where audio is the only format anyway
+    video_markup = None if is_spotify else audio_button(url)
 
     # 1. Quota & Permission Verification (cached links don't spend quota, so the daily limit doesn't block them)
-    cache_key = extract_youtube_id(url) if is_yt else url
     cached_data = cache.get(cache_key, format_type)
     allowed, reason, user_data = user_db.check_download_permission(user_id, platform)
     if not allowed and not (reason == "daily_limit_reached" and cached_data):
@@ -809,12 +958,12 @@ async def execute_download(
                 f"Para descargar de <b>{platform}</b>, solicita tu rango VIP a un administrador del grupo."
             )
             await context.bot.send_message(chat_id=chat_id, text=deny_text, parse_mode=ParseMode.HTML)
-            return
+            return False
 
         elif reason == "daily_limit_reached":
             await context.bot.send_message(chat_id=chat_id, text=daily_limit_text(user_data),
                                            parse_mode=ParseMode.HTML)
-            return
+            return False
 
     # 2. Cache hit: instant delivery (<0.5s)
     if cached_data:
@@ -877,9 +1026,11 @@ async def execute_download(
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                     supports_streaming=True,
+                    reply_markup=video_markup,
                 )
 
             user_db.record_download_success(user_id, platform, count_quota=False)
+            user_db.add_history(user_id, url, format_type, platform, cached_title)
 
             if status_message:
                 try:
@@ -893,14 +1044,14 @@ async def execute_download(
                 except Exception:
                     pass
 
-            return
+            return True
         except Exception as e:
             logger.info(f"Cached delivery failed, downloading fresh: {e}")
             if not allowed:
                 # Only the cache hit let this user past the daily limit
                 await context.bot.send_message(chat_id=chat_id, text=daily_limit_text(user_data),
                                                parse_mode=ParseMode.HTML)
-                return
+                return False
 
     # 3. Fresh download
     item_label = "audio MP3" if is_audio else "contenido"
@@ -908,7 +1059,8 @@ async def execute_download(
         try:
             await status_message.edit_text(
                 f"⏳ <b>Descargando {item_label} de {platform}...</b>",
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=CANCEL_MARKUP,
             )
         except Exception:
             pass
@@ -916,7 +1068,8 @@ async def execute_download(
         status_message = await context.bot.send_message(
             chat_id=chat_id,
             text=f"⏳ <b>Descargando {item_label} de {platform}...</b>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=CANCEL_MARKUP,
         )
 
     stop_chat_action = asyncio.Event()
@@ -925,10 +1078,18 @@ async def execute_download(
         keep_chat_action(context, chat_id, chat_action, stop_event=stop_chat_action)
     )
 
-    download_result = None
-    try:
+    async def run_download():
         async with download_semaphore:
-            download_result = await downloader.download(url, format_type=format_type)
+            return await downloader.download(url, format_type=format_type)
+
+    download_result = None
+    download_task = asyncio.create_task(run_download())
+    active_downloads.setdefault(user_id, set()).add(download_task)
+    try:
+        try:
+            download_result = await download_task
+        finally:
+            active_downloads.get(user_id, set()).discard(download_task)
 
         try:
             await status_message.edit_text(
@@ -1127,6 +1288,7 @@ async def execute_download(
                         supports_streaming=True,
                         read_timeout=300,
                         write_timeout=300,
+                        reply_markup=video_markup,
                     )
                     if sent_msg and sent_msg.video:
                         cache.set(
@@ -1147,6 +1309,7 @@ async def execute_download(
                         thumb_fp.close()
 
         user_db.record_download_success(user_id, platform)
+        user_db.add_history(user_id, url, format_type, platform, title)
         await notify_low_quota(context, chat_id, user_id, user_mention)
 
         try:
@@ -1160,12 +1323,23 @@ async def execute_download(
             except Exception as del_err:
                 logger.info(f"No se pudo eliminar el link original en el grupo: {del_err}")
 
+    except asyncio.CancelledError:
+        if not download_task.cancelled() or asyncio.current_task().cancelling():
+            raise  # the handler itself is being cancelled (shutdown), not a user cancel
+        try:
+            await status_message.edit_text(Cancelled.user_message)
+        except Exception:
+            pass
+
     except ValueError as val_err:
         logger.warning(f"Download error for {url}: {val_err} | {getattr(val_err, 'detail', '')[:300]}")
+        # Content errors (private, deleted, too large...) won't change by retrying
+        markup = None if getattr(val_err, 'content_error', False) else retry_button(url, format_type)
         try:
             await status_message.edit_text(
                 f"❌ <b>No se pudo descargar:</b>\n\n{html.escape(str(val_err))}",
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
             )
         except Exception:
             pass
@@ -1177,7 +1351,8 @@ async def execute_download(
             "Verifica que el video sea público y esté disponible."
         )
         try:
-            await status_message.edit_text(err_msg, parse_mode=ParseMode.HTML)
+            await status_message.edit_text(err_msg, parse_mode=ParseMode.HTML,
+                                           reply_markup=retry_button(url, format_type))
         except Exception:
             pass
 
@@ -1186,6 +1361,7 @@ async def execute_download(
         await chat_action_task
         if download_result:
             downloader.cleanup(download_result)
+    return True
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1225,7 +1401,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # 2. Stats
+    # 2. Cancel button on the "Descargando..." message (only cancels the presser's own downloads)
+    if data == "cancel":
+        count = cancel_user_downloads(user.id)
+        await query.answer("🛑 Cancelando..." if count else "No tienes descargas en curso.", show_alert=not count)
+        return
+
+    # 3. Buttons that act on a stored link: aud:<ref>, retry:<fmt>:<ref>, hist:<fmt>:<ref>
+    if data.startswith(("aud:", "retry:", "hist:")):
+        parts = data.split(":")
+        action = parts[0]
+        format_type, ref = ("mp3", parts[1]) if action == "aud" else (parts[1], parts[-1])
+        url = cache.url_from_ref(int(ref)) if ref.isdigit() else None
+        if not url or format_type not in ("mp3", "mp4"):
+            await query.answer("Este botón ya no es válido.", show_alert=True)
+            return
+        await query.answer()
+        await execute_download(
+            context=context,
+            chat_id=chat.id,
+            user_id=user.id,
+            user_mention=user.mention_html(),
+            url=url,
+            format_type=format_type,
+            # Retry reuses the error message as its status message
+            status_message=query.message if action == "retry" else None,
+            original_message=None,
+            is_group=chat.type in [ChatType.GROUP, ChatType.SUPERGROUP],
+        )
+        return
+
+    # 4. Stats
     if data == "show_stats":
         stats_text = user_db.get_stats_message(user.id, user.username, user.first_name)
         await query.answer()
@@ -1233,7 +1439,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(stats_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return
 
-    # 3. Menu navigation
+    # 5. Menu navigation
     if data == "main_menu":
         await query.answer()
         await query.edit_message_text(
@@ -1296,36 +1502,50 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    url = urls[0].strip()
-    platform, emoji = detect_platform(url)
-    is_yt = is_youtube_url(url)
-    is_spotify = is_spotify_url(url)
+    await download_links(update, context, unique_urls(text))
+
+
+async def download_links(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: list):
+    """Processes up to MAX_LINKS_PER_MESSAGE links from one message, in order."""
+    chat = update.effective_chat
+    user = update.effective_user
+    is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
     user_mention = user.mention_html() if user else "Usuario"
 
-    # If YouTube, offer MP3 vs MP4 selector
-    if is_yt:
-        video_id = extract_youtube_id(url)
-        reply_markup = get_format_selection_keyboard(video_id)
+    if len(urls) > MAX_LINKS_PER_MESSAGE:
         await update.message.reply_html(
-            f"{emoji} <b>{platform} detectado:</b>\n\n"
-            "¿En qué formato deseas descargarlo?",
-            reply_markup=reply_markup
+            f"ℹ️ Proceso como máximo <b>{MAX_LINKS_PER_MESSAGE}</b> enlaces por mensaje; "
+            "envía el resto en otro mensaje.")
+        urls = urls[:MAX_LINKS_PER_MESSAGE]
+
+    # In groups the link message is deleted after the last download; not when a YouTube
+    # format picker still needs it as context
+    has_youtube = any(is_youtube_url(u) for u in urls)
+    last_direct = next((u for u in reversed(urls) if not is_youtube_url(u)), None)
+
+    for url in urls:
+        if is_youtube_url(url):
+            platform, emoji = detect_platform(url)
+            await update.message.reply_html(
+                f"{emoji} <b>{platform} detectado:</b>\n\n"
+                "¿En qué formato deseas descargarlo?",
+                reply_markup=get_format_selection_keyboard(extract_youtube_id(url))
+            )
+            continue
+
+        delivered = await execute_download(
+            context=context,
+            chat_id=chat.id,
+            user_id=user.id,
+            user_mention=user_mention,
+            url=url,
+            format_type="mp3" if is_spotify_url(url) else "mp4",
+            status_message=None,
+            original_message=update.message if (url == last_direct and not has_youtube) else None,
+            is_group=is_group,
         )
-        return
-
-    forced_format = "mp3" if is_spotify else "mp4"
-
-    await execute_download(
-        context=context,
-        chat_id=chat.id,
-        user_id=user.id,
-        user_mention=user_mention,
-        url=url,
-        format_type=forced_format,
-        status_message=None,
-        original_message=update.message,
-        is_group=is_group,
-    )
+        if delivered is False:
+            break  # denied (limit / VIP): the user already got the explanation once
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1376,6 +1596,9 @@ def main():
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
         .request(request)
+        # Without this, updates run one at a time: one slow download blocked every other user
+        # (and /cancel). Parallel downloads stay capped by download_semaphore.
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -1395,6 +1618,9 @@ def main():
     app.add_handler(CommandHandler("unvip", unvip_cmd))
     app.add_handler(CommandHandler(["mp3", "audio", "musica"], mp3_command))
     app.add_handler(CommandHandler(["mp4", "video"], mp4_command))
+    app.add_handler(CommandHandler(["cancel", "cancelar"], cancel_command))
+    app.add_handler(CommandHandler(["historial", "history"], history_command))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))

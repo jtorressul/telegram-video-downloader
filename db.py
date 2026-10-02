@@ -16,6 +16,7 @@ NO_VIP_DAILY_LIMIT = 5
 VIP_DAILY_LIMIT = 15
 
 SOCIAL_PLATFORMS = {"Instagram", "TikTok", "X (Twitter)", "Facebook"}
+HISTORY_KEEP = 50
 
 
 def get_local_now() -> datetime:
@@ -67,6 +68,18 @@ class UserDatabase:
                 conn.execute("ALTER TABLE users ADD COLUMN vip_checked_at REAL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS download_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    url TEXT NOT NULL,
+                    format TEXT NOT NULL,
+                    platform TEXT,
+                    title TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON download_history (user_id, id)")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS known_groups (
                     group_id INTEGER PRIMARY KEY,
@@ -211,6 +224,27 @@ class UserDatabase:
                 user_id
             ))
             conn.commit()
+
+    def add_history(self, user_id: int, url: str, format_type: str, platform: str, title: Optional[str]):
+        """Stores a download, keeping only the most recent HISTORY_KEEP per user."""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO download_history (user_id, url, format, platform, title) VALUES (?, ?, ?, ?, ?)
+            """, (user_id, url, format_type, platform, (title or "")[:200]))
+            conn.execute("""
+                DELETE FROM download_history WHERE user_id = ? AND id NOT IN (
+                    SELECT id FROM download_history WHERE user_id = ? ORDER BY id DESC LIMIT ?)
+            """, (user_id, user_id, HISTORY_KEEP))
+            conn.commit()
+
+    def get_history(self, user_id: int, limit: int = 10) -> list:
+        """Most recent downloads first, one entry per (url, format)."""
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT url, format, platform, title, MAX(id) AS last_id FROM download_history
+                WHERE user_id = ? GROUP BY url, format ORDER BY last_id DESC LIMIT ?
+            """, (user_id, limit)).fetchall()
+            return [dict(r) for r in rows]
 
     def get_quota(self, user_id: int) -> Tuple[int, int]:
         """Returns (used_today, daily_limit) for the user."""
