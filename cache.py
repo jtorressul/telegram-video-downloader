@@ -6,7 +6,10 @@ from urllib.parse import urlparse, urlunparse, parse_qs
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "cache.db")
+# DATA_DIR lets containers keep the databases on a persistent volume
+DATA_DIR = os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "cache.db")
 
 
 def normalize_url(url: str) -> str:

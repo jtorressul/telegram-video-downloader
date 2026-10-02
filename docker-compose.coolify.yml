@@ -1,0 +1,57 @@
+# Despliegue en Coolify (Build Pack: Docker Compose, archivo: docker-compose.coolify.yml).
+# Las variables ${...} aparecen en la pestaña "Environment Variables" de Coolify.
+# Diferencia con docker-compose.yml: red bridge de Coolify, así que no hay rotación IPv6;
+# la salida alternativa es el contenedor de Cloudflare WARP incluido aquí.
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS:-}
+      - TIMEZONE=${TIMEZONE:-America/New_York}
+      - ANONYMOUS_ONLY=${ANONYMOUS_ONLY:-true}
+      - COBALT_INSTANCES=${COBALT_INSTANCES:-}
+      - COBALT_API_KEY=${COBALT_API_KEY:-}
+      - SPOTIFY_MAX_TRACKS=${SPOTIFY_MAX_TRACKS:-25}
+      - DATA_DIR=/app/data
+      - WARP_PROXY=socks5h://warp:1080
+      - BGUTIL_BASE_URL=http://bgutil-provider:4416
+      - PORT=8080
+    volumes:
+      - bot-data:/app/data
+    depends_on:
+      - bgutil-provider
+      - warp
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Genera PO tokens de YouTube sin cuenta
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    restart: unless-stopped
+
+  # Cloudflare WARP gratis como proxy SOCKS5 interno (warp:1080)
+  warp:
+    image: caomingjun/warp
+    restart: unless-stopped
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - MKNOD
+      - AUDIT_WRITE
+      - NET_ADMIN
+    device_cgroup_rules:
+      - 'c 10:200 rwm'
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+
+volumes:
+  bot-data:
+  warp-data:

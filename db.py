@@ -6,7 +6,10 @@ from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "bot_users.db")
+# DATA_DIR lets containers keep the databases on a persistent volume
+DATA_DIR = os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "bot_users.db")
 
 NO_VIP_DAILY_LIMIT = 5
 VIP_DAILY_LIMIT = 15

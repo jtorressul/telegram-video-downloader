@@ -38,7 +38,10 @@ def canonical(url: str) -> str:
 
 def _ytdlp_with(clients):
     def run(url: str, format_type: str, workdir: str, route: Route) -> Dict[str, Any]:
-        extra: Dict[str, Any] = {'extractor_args': {'youtube': {'player_client': clients}}}
+        args: Dict[str, Any] = {'youtube': {'player_client': clients}}
+        if config.BGUTIL_BASE_URL:
+            args['youtubepot-bgutilhttp'] = {'base_url': [config.BGUTIL_BASE_URL]}
+        extra: Dict[str, Any] = {'extractor_args': args}
         return ydl_download(canonical(url), format_type, workdir, route, PLATFORM, EMOJI, extra)
     return run
 

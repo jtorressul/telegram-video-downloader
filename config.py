@@ -43,6 +43,8 @@ WARP_PROXY = os.getenv("WARP_PROXY", "").strip()
 PROXY = (os.getenv("YTDL_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
 
 # --- Servicios externos ---
+# Servidor bgutil de PO tokens de YouTube; vacío = http://127.0.0.1:4416 (valor por defecto del plugin)
+BGUTIL_BASE_URL = os.getenv("BGUTIL_BASE_URL", "").strip()
 _cobalt = _list("COBALT_INSTANCES")
 _cobalt_single = os.getenv("COBALT_API_URL", "").strip()
 if _cobalt_single and _cobalt_single not in _cobalt:
