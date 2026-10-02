@@ -1,6 +1,9 @@
 import os
 import re
 import html
+import json
+import shutil
+import tempfile
 import asyncio
 import logging
 import threading
@@ -54,6 +57,7 @@ from downloaders import (
     normalize_instagram_url,
 )
 from downloaders import health
+from downloaders.common import apply_id3_tags, media_result, to_mp3
 from downloaders.errors import Cancelled
 from downloaders.instagram import igexport_status
 from downloaders.diag import run_diagnostics
@@ -93,6 +97,10 @@ MAX_LINKS_PER_MESSAGE = 5
 
 # In-flight downloads per user, so /cancel and the ✖️ button can stop them
 active_downloads: Dict[int, Set[asyncio.Task]] = {}
+# In-flight downloads per (cache_key, format): later requests for the same link wait and reuse the cache
+inflight_downloads: Dict[Tuple[str, str], asyncio.Event] = {}
+# Bot API only lets bots download files up to 20 MB (needed to reuse a cached video for MP3)
+BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 
 
 def canonical_url(url: str) -> Tuple[str, str]:
@@ -1068,8 +1076,8 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     results = []
     for fmt in ("mp4", "mp3"):
         cached = cache.get(cache_key, fmt)
-        if not cached:
-            continue
+        if not cached or cached.get('media_type') == 'album':
+            continue  # inline results can't carry albums
         caption = _inline_caption(cached, url, emoji, bot_username)
         result_id = f"{fmt}-{cache.url_ref(url)}"
         title = (cached.get('title') or platform)[:60]
@@ -1108,6 +1116,101 @@ async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "💡 Hazme administrador con permiso de <b>'Eliminar mensajes'</b> para activar la auto-limpieza."
             )
             break
+
+
+def album_items_to_cache(messages) -> list:
+    """Telegram messages of a sent media group → [{type, file_id}] for the cache."""
+    items = []
+    for msg in messages:
+        if msg.video:
+            items.append({"type": "video", "file_id": msg.video.file_id})
+        elif msg.photo:
+            items.append({"type": "photo", "file_id": msg.photo[-1].file_id})
+        elif msg.audio:
+            items.append({"type": "audio", "file_id": msg.audio.file_id})
+    return items
+
+
+async def send_cached_media(context, chat_id: int, cached: dict, *, url: str, platform: str, emoji: str,
+                            user_mention: str, is_audio: bool, video_markup=None):
+    """Re-sends cached media by Telegram file_id (photo, audio, video or album). Raises on failure."""
+    cached_title = cached.get('title') or 'Media'
+    clean_title = html.escape(cached_title[:200] + ('...' if len(cached_title) > 200 else ''))
+    clean_url = html.escape(url)
+    duration = cached.get('duration')
+    filesize = cached.get('filesize') or 0
+    performer = cached.get('performer')
+    clean_performer = html.escape(performer or '')
+    shown_platform = cached.get('platform', platform)
+    footer = (f"👤 <b>Pedido por:</b> {user_mention}\n\n"
+              f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
+              f"⚡ <i>Descarga instantánea</i>")
+    media_type = cached.get('media_type')
+
+    if media_type == 'album':
+        items = json.loads(cached['file_id'])
+        caption = (f"📸 <b>{clean_title}</b>\n\n"
+                   f"{emoji} <b>Plataforma:</b> {shown_platform}\n"
+                   f"📦 <b>Tamaño total:</b> {format_filesize(filesize)}\n" + footer)
+        media = []
+        for idx, item in enumerate(items):
+            extra = {"caption": caption, "parse_mode": ParseMode.HTML} if idx == 0 else {}
+            if item["type"] == "video":
+                media.append(InputMediaVideo(media=item["file_id"], supports_streaming=True, **extra))
+            elif item["type"] == "audio":
+                media.append(InputMediaAudio(media=item["file_id"], **extra))
+            else:
+                media.append(InputMediaPhoto(media=item["file_id"], **extra))
+        for start in range(0, len(media), 10):
+            await context.bot.send_media_group(chat_id=chat_id, media=media[start:start + 10])
+    elif media_type == 'photo':
+        caption = (f"📸 <b>{clean_title}</b>\n\n"
+                   f"{emoji} <b>Plataforma:</b> {shown_platform}\n"
+                   f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n" + footer)
+        await context.bot.send_photo(chat_id=chat_id, photo=cached['file_id'], caption=caption,
+                                     parse_mode=ParseMode.HTML)
+    elif is_audio or media_type == 'audio':
+        caption = (f"🎵 <b>{clean_title}</b>\n"
+                   + (f"🎤 <b>Canal/Artista:</b> {clean_performer}\n" if clean_performer else "")
+                   + f"{emoji} <b>Plataforma:</b> {shown_platform}\n"
+                   f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
+                   f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n" + footer)
+        await context.bot.send_audio(chat_id=chat_id, audio=cached['file_id'], caption=caption,
+                                     parse_mode=ParseMode.HTML, title=cached_title, performer=performer,
+                                     duration=duration)
+    else:
+        caption = (f"🎬 <b>{clean_title}</b>\n\n"
+                   f"{emoji} <b>Plataforma:</b> {shown_platform}\n"
+                   f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
+                   f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n" + footer)
+        await context.bot.send_video(chat_id=chat_id, video=cached['file_id'], caption=caption,
+                                     parse_mode=ParseMode.HTML, supports_streaming=True,
+                                     reply_markup=video_markup)
+
+
+async def audio_from_cached_video(context, cache_key: str, platform: str, emoji: str) -> Optional[dict]:
+    """Builds the MP3 from the cached MP4 (via Telegram, not the platform). None if not possible."""
+    cached = cache.get(cache_key, "mp4")
+    if not cached or cached.get('media_type') not in (None, 'video'):
+        return None
+    if (cached.get('filesize') or 0) > BOT_API_DOWNLOAD_LIMIT:
+        return None
+    workdir = tempfile.mkdtemp(dir=downloader.temp_dir, prefix="tgbot_cached_")
+    try:
+        tg_file = await context.bot.get_file(cached['file_id'])
+        video_path = os.path.join(workdir, "cached.mp4")
+        await tg_file.download_to_drive(video_path)
+        mp3_path = await asyncio.to_thread(to_mp3, video_path, os.path.join(workdir, "audio.mp3"))
+        title = cached.get('title') or f"Audio de {platform}"
+        await asyncio.to_thread(apply_id3_tags, mp3_path, title, platform)
+        result = media_result('audio', mp3_path, platform, emoji, title, platform,
+                              duration=cached.get('duration'))
+        result['temp_dir'] = workdir
+        return result
+    except Exception as e:
+        logger.info(f"No se pudo reutilizar el video en caché para MP3, descargando: {e}")
+        shutil.rmtree(workdir, ignore_errors=True)
+        return None
 
 
 LOW_QUOTA_THRESHOLD = 2
@@ -1193,93 +1296,51 @@ async def execute_download(
             return False
 
     # 2. Cache hit: instant delivery (<0.5s)
-    if cached_data:
+    async def deliver_from_cache(entry) -> bool:
         try:
-            cached_title = cached_data.get('title', 'Media')
-            clean_title = html.escape(cached_title[:200] + ('...' if len(cached_title) > 200 else ''))
-            duration = cached_data.get('duration')
-            filesize = cached_data.get('filesize', 0)
-            performer = cached_data.get('performer')
-            clean_performer = html.escape(performer or '')
-
-            if cached_data.get('media_type') == 'photo':
-                caption = (
-                    f"📸 <b>{clean_title}</b>\n\n"
-                    f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
-                    f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
-                    f"👤 <b>Pedido por:</b> {user_mention}\n\n"
-                    f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
-                    f"⚡ <i>Descarga instantánea</i>"
-                )
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=cached_data['file_id'],
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            elif is_audio or cached_data.get('media_type') == 'audio':
-                caption = (
-                    f"🎵 <b>{clean_title}</b>\n"
-                    + (f"🎤 <b>Canal/Artista:</b> {clean_performer}\n" if clean_performer else "")
-                    + f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
-                    f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
-                    f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
-                    f"👤 <b>Pedido por:</b> {user_mention}\n\n"
-                    f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
-                    f"⚡ <i>Descarga instantánea</i>"
-                )
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=cached_data['file_id'],
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    title=cached_title,
-                    performer=performer,
-                    duration=duration,
-                )
-            else:
-                caption = (
-                    f"🎬 <b>{clean_title}</b>\n\n"
-                    f"{emoji} <b>Plataforma:</b> {cached_data.get('platform', platform)}\n"
-                    f"⏱ <b>Duración:</b> {format_duration(duration)}\n"
-                    f"📦 <b>Tamaño:</b> {format_filesize(filesize)}\n"
-                    f"👤 <b>Pedido por:</b> {user_mention}\n\n"
-                    f"🔗 <a href=\"{clean_url}\">Link original</a>\n"
-                    f"⚡ <i>Descarga instantánea</i>"
-                )
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=cached_data['file_id'],
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    supports_streaming=True,
-                    reply_markup=video_markup,
-                )
-
-            user_db.record_download_success(user_id, platform, count_quota=False)
-            user_db.log_download(user_id, platform, ok=True, cached=True)
-            user_db.add_history(user_id, url, format_type, platform, cached_title)
-
-            if status_message:
-                try:
-                    await status_message.delete()
-                except Exception:
-                    pass
-
-            if is_group and original_message:
-                try:
-                    await original_message.delete()
-                except Exception:
-                    pass
-
-            return True
+            await send_cached_media(context, chat_id, entry, url=url, platform=platform, emoji=emoji,
+                                    user_mention=user_mention, is_audio=is_audio, video_markup=video_markup)
         except Exception as e:
             logger.info(f"Cached delivery failed, downloading fresh: {e}")
-            if not allowed:
-                # Only the cache hit let this user past the daily limit
-                await context.bot.send_message(chat_id=chat_id, text=daily_limit_text(user_data),
-                                               parse_mode=ParseMode.HTML)
-                return False
+            return False
+        user_db.record_download_success(user_id, platform, count_quota=False)
+        user_db.log_download(user_id, platform, ok=True, cached=True)
+        user_db.add_history(user_id, url, format_type, platform, entry.get('title'))
+        for msg in (status_message, original_message if is_group else None):
+            if msg:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+        return True
+
+    if cached_data and await deliver_from_cache(cached_data):
+        return True
+
+    # 2b. Same link already downloading for someone else: wait and reuse its result
+    inflight_key = (cache_key, format_type)
+    inflight = inflight_downloads.get(inflight_key)
+    if inflight:
+        waiting_text = "⏳ <b>Ese enlace ya se está descargando</b>, en un momento te lo envío..."
+        if status_message:
+            try:
+                await status_message.edit_text(waiting_text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        else:
+            status_message = await context.bot.send_message(chat_id=chat_id, text=waiting_text,
+                                                            parse_mode=ParseMode.HTML)
+        await inflight.wait()
+        cached_data = cache.get(cache_key, format_type)
+        if cached_data and await deliver_from_cache(cached_data):
+            return True
+        # The other download failed or was cancelled: try on our own below
+
+    if not allowed:
+        # Only a (now unusable) cache hit let this user past the daily limit
+        await context.bot.send_message(chat_id=chat_id, text=daily_limit_text(user_data),
+                                       parse_mode=ParseMode.HTML)
+        return False
 
     # 3. Fresh download
     item_label = "audio MP3" if is_audio else "contenido"
@@ -1308,9 +1369,15 @@ async def execute_download(
 
     async def run_download():
         async with download_semaphore:
+            if is_audio and not is_spotify:
+                result = await audio_from_cached_video(context, cache_key, platform, emoji)
+                if result:
+                    return result
             return await downloader.download(url, format_type=format_type)
 
     download_result = None
+    inflight_event = asyncio.Event()
+    inflight_downloads[inflight_key] = inflight_event
     download_task = asyncio.create_task(run_download())
     active_downloads.setdefault(user_id, set()).add(download_task)
     try:
@@ -1475,12 +1542,28 @@ async def execute_download(
 
             try:
                 # Telegram allows at most 10 items per media group
+                sent_messages = []
                 for start in range(0, len(media_group), 10):
-                    await context.bot.send_media_group(
+                    sent_messages += await context.bot.send_media_group(
                         chat_id=chat_id,
                         media=media_group[start:start + 10],
                         read_timeout=300,
                         write_timeout=300,
+                    )
+                album = album_items_to_cache(sent_messages)
+                if album and len(album) == len(media_group):
+                    cache.set(
+                        video_id_or_url=cache_key,
+                        format_type=format_type,
+                        file_id=json.dumps(album),
+                        title=title,
+                        platform=platform,
+                        duration=None,
+                        width=None,
+                        height=None,
+                        filesize=filesize,
+                        is_audio=False,
+                        media_type='album',
                     )
             finally:
                 for fp in open_files:
@@ -1588,6 +1671,10 @@ async def execute_download(
             pass
 
     finally:
+        # Wake up anyone waiting for this link (they re-check the cache, or download themselves)
+        inflight_event.set()
+        if inflight_downloads.get(inflight_key) is inflight_event:
+            del inflight_downloads[inflight_key]
         stop_chat_action.set()
         await chat_action_task
         if download_result:

@@ -19,6 +19,7 @@ from downloaders.errors import Cancelled, IPBlocked, Private  # noqa: E402
 from downloaders.net import DIRECT  # noqa: E402
 
 USER = 42
+OTHER_USER = 43
 TIKTOK = "https://www.tiktok.com/@a/video/1"
 TIKTOK2 = "https://www.tiktok.com/@a/video/2"
 
@@ -68,6 +69,27 @@ class FakeBot:
 
     async def send_chat_action(self, *a, **kw):
         return None
+
+    async def send_media_group(self, chat_id, media, **kw):
+        msgs = []
+        for item in media:
+            msg = FakeMessage(self, getattr(item, "caption", "") or "")
+            is_video = type(item).__name__ == "InputMediaVideo"
+            msg.video = msg.video if is_video else None
+            msg.audio = None
+            msg.photo = [] if is_video else msg.photo
+            msg.media_ref = item.media if isinstance(item.media, str) else None
+            self.sent.append(("album_item", msg))
+            msgs.append(msg)
+        return msgs
+
+    async def get_file(self, file_id):
+        self.sent.append(("get_file", file_id))
+
+        async def download_to_drive(path):
+            with open(path, "wb") as f:
+                f.write(b"cached-video")
+        return types.SimpleNamespace(download_to_drive=download_to_drive)
 
     async def get_me(self):
         return types.SimpleNamespace(username="testbot")
@@ -242,3 +264,101 @@ def test_inline_cached_returns_video_instantly(env):
 def test_inline_vip_platform_blocked_for_free_users(env):
     a = _inline(env, "https://www.youtube.com/watch?v=jNQXAC9IVRw")
     assert a["results"] == [] and "VIP" in a["button"].text
+
+
+# --- Phase 4: carousels cached, concurrent dedupe, MP3 from cached MP4 ----------------------
+def _album_result(tmp_path):
+    files = []
+    for i, kind in enumerate(["photo", "video", "photo"]):
+        f = tmp_path / f"item{i}"
+        f.write_bytes(b"x")
+        files.append({"type": kind, "file_path": str(f)})
+    return {"type": "carousel", "media_items": files, "title": "Carrusel", "filesize": 30}
+
+
+def test_carousel_is_cached_and_resent_by_file_id(env, tmp_path, monkeypatch):
+    async def album_download(url, format_type="mp4", cancel=None):
+        env.state.calls.append((url, format_type))
+        return _album_result(tmp_path)
+    monkeypatch.setattr(bot.downloader, "download", album_download)
+
+    asyncio.run(download(env))
+    asyncio.run(download(env))
+    assert len(env.state.calls) == 1
+    resent = [m for kind, m in env.bot.sent if kind == "album_item"][3:]
+    assert len(resent) == 3 and all(m.media_ref for m in resent)
+    assert "instantánea" in resent[0].text
+    assert env.db.get_quota(USER)[0] == 1  # second time came from cache: no quota
+
+
+def test_inline_skips_cached_albums(env, tmp_path, monkeypatch):
+    async def album_download(url, format_type="mp4", cancel=None):
+        return _album_result(tmp_path)
+    monkeypatch.setattr(bot.downloader, "download", album_download)
+    asyncio.run(download(env))
+    a = _inline(env, TIKTOK)
+    assert a["results"] == [] and a["button"].start_parameter.startswith("dl_")
+
+
+def test_concurrent_requests_for_same_link_download_once(env):
+    async def scenario():
+        env.state.gate = asyncio.Event()
+        first = asyncio.create_task(download(env))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(bot.execute_download(
+            context=env.ctx, chat_id=2, user_id=OTHER_USER, user_mention="@o", url=TIKTOK, format_type="mp4"))
+        await asyncio.sleep(0.05)
+        assert any("ya se está descargando" in t for t in env.bot.texts())
+        env.state.gate.set()
+        return await asyncio.gather(first, second)
+
+    assert asyncio.run(scenario()) == [True, True]
+    assert len(env.state.calls) == 1
+    assert sum(kind == "video" for kind, _ in env.bot.sent) == 2
+    assert env.db.get_quota(OTHER_USER)[0] == 0  # served from the first download's cache
+    assert bot.inflight_downloads == {}
+
+
+def test_waiter_downloads_itself_when_first_download_fails(env, monkeypatch):
+    real_download = bot.downloader.download
+
+    async def first_call_fails(url, format_type="mp4", cancel=None):
+        env.state.error = IPBlocked("403") if not env.state.calls else None
+        return await real_download(url, format_type, cancel)
+    monkeypatch.setattr(bot.downloader, "download", first_call_fails)
+
+    async def scenario():
+        env.state.gate = asyncio.Event()
+        first = asyncio.create_task(download(env))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(bot.execute_download(
+            context=env.ctx, chat_id=2, user_id=OTHER_USER, user_mention="@o", url=TIKTOK, format_type="mp4"))
+        await asyncio.sleep(0.05)
+        env.state.gate.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+    assert len(env.state.calls) == 2
+    assert sum(kind == "video" for kind, _ in env.bot.sent) == 1
+
+
+def test_mp3_reuses_cached_video_without_platform_download(env, monkeypatch):
+    def fake_to_mp3(src, dst):
+        with open(dst, "wb") as f:
+            f.write(b"mp3")
+        return dst
+    monkeypatch.setattr(bot, "to_mp3", fake_to_mp3)
+    asyncio.run(download(env))           # mp4 from the platform
+    asyncio.run(download(env, fmt="mp3"))  # mp3 from the cached mp4
+    assert env.state.calls == [(TIKTOK, "mp4")]
+    assert ("get_file", "vid-0") in env.bot.sent or any(k == "get_file" for k, _ in env.bot.sent)
+    assert any(kind == "audio" for kind, _ in env.bot.sent)
+    assert env.cache.get(TIKTOK, "mp3")["media_type"] == "audio"
+
+
+def test_mp3_falls_back_to_platform_for_big_cached_video(env, monkeypatch):
+    monkeypatch.setattr(bot, "BOT_API_DOWNLOAD_LIMIT", 1)
+    asyncio.run(download(env))
+    asyncio.run(download(env, fmt="mp3"))
+    assert env.state.calls == [(TIKTOK, "mp4"), (TIKTOK, "mp3")]
+    assert not any(kind == "get_file" for kind, _ in env.bot.sent)
