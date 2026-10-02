@@ -4,7 +4,6 @@ import html
 import asyncio
 import logging
 import threading
-import tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from dotenv import load_dotenv
@@ -13,6 +12,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaAudio,
     InputMediaPhoto,
     InputMediaVideo,
 )
@@ -29,7 +29,8 @@ from telegram.ext import (
     filters,
 )
 
-from downloader import (
+import config
+from downloaders import (
     VideoDownloader,
     detect_platform,
     format_duration,
@@ -38,6 +39,8 @@ from downloader import (
     is_spotify_url,
     normalize_instagram_url,
 )
+from downloaders import health
+from downloaders.diag import run_diagnostics
 from cache import VideoCache
 from db import (
     UserDatabase,
@@ -58,23 +61,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip()
-raw_cookies = os.getenv("YOUTUBE_COOKIES") or os.getenv("COOKIES_CONTENT")
-if raw_cookies and (not os.path.exists(COOKIES_FILE) or os.path.getsize(COOKIES_FILE) == 0):
-    env_cookies_path = os.path.join(tempfile.gettempdir(), "server_cookies.txt")
-    try:
-        with open(env_cookies_path, "w", encoding="utf-8") as f:
-            f.write(raw_cookies.strip() + "\n")
-        COOKIES_FILE = env_cookies_path
-        logger.info("✅ Cookies cargadas exitosamente desde variable de entorno.")
-    except Exception as e_cook:
-        logger.warning(f"Error escribiendo cookies desde variable de entorno: {e_cook}")
-
-ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip().isdigit()]
+TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
+ADMIN_IDS = config.ADMIN_IDS
 
 # Initialize services
-downloader = VideoDownloader(cookies_file=COOKIES_FILE if (os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0) else None)
+downloader = VideoDownloader()
 cache = VideoCache()
 user_db = UserDatabase()
 
@@ -371,6 +362,20 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     stats_text = user_db.get_stats_message(user.id, user.username, user.first_name)
     await update.message.reply_html(stats_text)
+
+
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: shows egress routes, blocked platforms and per-strategy health."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    msg = await update.message.reply_text("🔎 Ejecutando diagnóstico de red...")
+    report = await asyncio.to_thread(run_diagnostics)
+    stats_lines = [
+        f"{name}: ✅{st['ok']} ❌{st['fail']}" + (f" ⏸{st['paused_s']}s" if st['paused_s'] else "")
+        for name, st in health.snapshot().items()
+    ]
+    text = report + ("\n\n── Estrategias\n" + "\n".join(stats_lines) if stats_lines else "")
+    await msg.edit_text(f"<pre>{html.escape(text[:3900])}</pre>", parse_mode=ParseMode.HTML)
 
 
 async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -848,11 +853,27 @@ async def execute_download(
             open_files = []
             media_group = []
             media_items = download_result.get('media_items', [])
-            for idx, item in enumerate(media_items[:10]):
+            for idx, item in enumerate(media_items):
                 item_fp = open(item['file_path'], 'rb')
                 open_files.append(item_fp)
                 item_caption = caption if idx == 0 else None
-                if item.get('type') == 'video':
+                if item.get('type') == 'audio':
+                    t_p = item.get('thumbnail_path')
+                    t_fp = open(t_p, 'rb') if (t_p and os.path.exists(t_p)) else None
+                    if t_fp:
+                        open_files.append(t_fp)
+                    media_group.append(
+                        InputMediaAudio(
+                            media=item_fp,
+                            thumbnail=t_fp,
+                            caption=item_caption,
+                            parse_mode=ParseMode.HTML if item_caption else None,
+                            title=item.get('title'),
+                            performer=item.get('artist'),
+                            duration=item.get('duration'),
+                        )
+                    )
+                elif item.get('type') == 'video':
                     t_p = item.get('thumbnail_path')
                     t_fp = open(t_p, 'rb') if (t_p and os.path.exists(t_p)) else None
                     if t_fp:
@@ -876,12 +897,14 @@ async def execute_download(
                     )
 
             try:
-                await context.bot.send_media_group(
-                    chat_id=chat_id,
-                    media=media_group,
-                    read_timeout=300,
-                    write_timeout=300,
-                )
+                # Telegram allows at most 10 items per media group
+                for start in range(0, len(media_group), 10):
+                    await context.bot.send_media_group(
+                        chat_id=chat_id,
+                        media=media_group[start:start + 10],
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
             finally:
                 for fp in open_files:
                     try:
@@ -949,7 +972,7 @@ async def execute_download(
                 logger.info(f"No se pudo eliminar el link original en el grupo: {del_err}")
 
     except ValueError as val_err:
-        logger.warning(f"Validation error for {url}: {val_err}")
+        logger.warning(f"Download error for {url}: {val_err} | {getattr(val_err, 'detail', '')[:300]}")
         try:
             await status_message.edit_text(
                 f"❌ <b>No se pudo descargar:</b>\n\n{html.escape(str(val_err))}",
@@ -1189,6 +1212,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("vip", vip_cmd))
+    app.add_handler(CommandHandler("diag", diag_command))
     app.add_handler(CommandHandler("unvip", unvip_cmd))
     app.add_handler(CommandHandler(["mp3", "audio", "musica"], mp3_command))
     app.add_handler(CommandHandler(["mp4", "video"], mp4_command))

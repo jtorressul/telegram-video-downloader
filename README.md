@@ -1,18 +1,23 @@
-# 🎬 Bot de Telegram: Descargador Multi-Plataforma con Arquitectura Zero-Cookies & Sistema VIP
+# 🎬 Bot de Telegram: Descargador Multi-Plataforma Anónimo & Sistema VIP
 
-Bot de Telegram desarrollado en Python para descargar videos, fotos y música en alta calidad desde **TikTok, X (Twitter), Instagram, YouTube, Spotify y Facebook**, con sistema integrado de membresías **VIP vs NO VIP PASS**, control de cuotas diarias, estadísticas personales y arquitectura **Zero-Cookies** optimizada para despliegue en **Render**.
+Bot de Telegram desarrollado en Python para descargar videos, fotos y música desde **TikTok, X (Twitter), Instagram, YouTube, Spotify y Facebook**, con membresías **VIP vs NO VIP PASS**, cuotas diarias y estadísticas. Funciona **sin cookies, tokens ni cuentas** de las plataformas: lo único obligatorio es el token del bot de Telegram.
 
 ---
 
 ## ✨ Características Principales
 
-1. **Arquitectura Zero-Cookies (Sin Depender de Sesiones ni Cookies):**
-   * **TikTok:** Extracción directa sin marca de agua vía `TikWM API`.
-   * **X (Twitter):** Extracción directa en HD y fotos vía `FxTwitter API` (soporta contenido +18/sensible sin requerir inicio de sesión).
-   * **Instagram:** Extracción multi-capa anónima (Polaris Web GraphQL con impersonación TLS Chrome 124 mediante `curl_cffi` + Bridge APIs). No exige `INSTAGRAM_SESSIONID`.
-   * **YouTube:** Descarga asistida por Bridge API y clientes móviles rotativos de `yt-dlp` (`visionos`, `android_vr`, `tv`) con `yt-dlp-ejs` para resolver firmas JavaScript sin error 429 en Render.
-   * **Spotify:** Extracción de metadatos oficiales vía oEmbed, descarga de audio en alta fidelidad y etiquetado ID3 completo (portada HD, título y artista incrustados con `mutagen`).
-   * **Facebook:** Extracción de reels y videos públicos.
+1. **Descargas 100% anónimas (sin cookies ni sesiones):** cada plataforma tiene una cadena de estrategias que se prueban en orden, por cada ruta de red disponible (IPv4 directa → IPv6 rotativa → Cloudflare WARP). Si una estrategia falla varias veces por bloqueo de IP, se pausa 10 minutos (circuit breaker).
+
+   | Plataforma | Estrategias (en orden) |
+   | :--- | :--- |
+   | 🎵 TikTok | API TikWM → yt-dlp → Cobalt |
+   | 🐦 X (Twitter) | FxTwitter → VxTwitter → API syndication → yt-dlp |
+   | 📸 Instagram | Página embed → Polaris GraphQL anónimo → yt-dlp → Cobalt → OpenGraph |
+   | ▶️ YouTube | yt-dlp con PO tokens sin cuenta (bgutil) y rotación de clientes → Cobalt |
+   | 🟢 Spotify | Metadatos del embed público (canción, álbum o playlist) → audio equivalente en SoundCloud/YouTube elegido por duración, etiquetas ID3 y portada |
+   | 👥 Facebook | yt-dlp → OpenGraph |
+
+   Errores claros: el bot distingue entre *IP bloqueada*, *demasiadas peticiones*, *+18/región*, *privado* y *no existe*. El contenido privado o con restricción de edad **no** se puede descargar sin cuenta.
 
 2. **👑 Sistema de Membresías y Límites:**
    | Rango | Estado en `/stats` | Cuota Diaria | Plataformas Permitidas |
@@ -47,6 +52,7 @@ Bot de Telegram desarrollado en Python para descargar videos, fotos y música en
 | `/unvip [user_id]` | (Solo Admins) Quita el rango VIP a un usuario. |
 | `/mp3 [enlace]` | Fuerza la descarga en formato de audio MP3. |
 | `/mp4 [enlace]` | Fuerza la descarga en formato de video MP4. |
+| `/diag` | (Solo Admins) Muestra la IP de salida, qué plataformas bloquean al servidor y la salud de cada estrategia. |
 
 ---
 
@@ -54,7 +60,7 @@ Bot de Telegram desarrollado en Python para descargar videos, fotos y música en
 
 ### 1. Clonar o ingresar a la carpeta
 ```bash
-cd /home/jonparrow/Documentos/bot2
+cd botnew
 ```
 
 ### 2. Configurar el archivo `.env`
@@ -70,7 +76,9 @@ TIMEZONE=America/New_York
 
 ### 3. Instalar dependencias
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # incluye pytest
+pytest                                 # tests unitarios (sin red)
+pytest -m live                         # descargas reales contra cada plataforma
 ```
 
 ### 4. Probar una descarga en la terminal (Sin abrir Telegram)
@@ -84,6 +92,36 @@ python3 test_download.py "https://www.tiktok.com/@tiktok/video/..."
 # O directamente:
 python3 bot.py
 ```
+
+---
+
+## 🖥️ Despliegue en un VPS (recomendado)
+
+Las plataformas bloquean las IPs de datacenter (Render, VPN, VPS). El bot lo compensa usando
+servicios externos cuando puede y repartiendo el tráfico entre varias salidas **gratuitas** del propio VPS.
+
+```bash
+# 1. Diagnóstico inicial: ¿qué plataformas bloquean tu VPS?
+python3 diag.py
+
+# 2. Rotación IPv6 (la mejora más grande; casi todos los VPS traen un /64)
+sudo bash deploy/setup_ipv6.sh          # imprime IPV6_PREFIX=... para el .env
+
+# 3. Cloudflare WARP como salida alternativa (gratis, sin cuenta)
+sudo bash deploy/setup_warp.sh          # imprime WARP_PROXY=... para el .env
+
+# 4. Arrancar bot + servidor de PO tokens de YouTube
+docker compose up -d --build
+
+# 5. Diagnóstico otra vez, ahora por cada ruta
+docker compose exec telegram-downloader-bot python diag.py
+```
+
+`yt-dlp` se actualiza solo en cada arranque del contenedor (`AUTO_UPDATE_YTDLP=true`). Para mantenerlo al día,
+puedes reiniciarlo una vez al día con cron: `0 5 * * * cd /ruta/botnew && docker compose restart telegram-downloader-bot`.
+
+> ⚠️ No configures cuentas de Instagram en el VPS: iniciar sesión desde una IP de datacenter hace que Meta
+> suspenda la cuenta. Por eso `ANONYMOUS_ONLY=true` viene activado por defecto.
 
 ---
 

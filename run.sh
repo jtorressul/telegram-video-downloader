@@ -21,5 +21,5 @@ else
     PYTHON="python3"
 fi
 
-echo "🚀 Iniciando Bot Multimedia Zero-Cookies..."
+echo "🚀 Iniciando Bot Multimedia (modo anónimo)..."
 exec "$PYTHON" bot.py

@@ -15,15 +15,7 @@ services:
         sync: false
       - key: PORT
         value: 8080
-      - key: IG_USERNAME
-        sync: false
-      - key: IG_PASSWORD
-        sync: false
-      - key: INSTAGRAM_SESSIONID
-        sync: false
-      - key: COBALT_API_URL
-        sync: false
-      - key: YOUTUBE_COOKIES
+      - key: COBALT_INSTANCES
         sync: false
       - key: YTDL_PROXY
         sync: false

@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Instalar dependencias del sistema: FFmpeg para audio/video, Node.js para yt-dlp-ejs y curl
+# FFmpeg para audio/video, Node.js para yt-dlp-ejs, curl para diagnósticos
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     nodejs \
@@ -9,14 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Instalar dependencias de Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar el código del bot
 COPY . .
+RUN chmod +x deploy/entrypoint.sh
 
-# Puertos para health checks de Render (8080 y 10000)
-EXPOSE 8080 10000
+EXPOSE 8080
 
-CMD ["python", "bot.py"]
+CMD ["deploy/entrypoint.sh"]

@@ -1,0 +1,3 @@
+# OPCIONAL: solo si pones ANONYMOUS_ONLY=false y quieres usar una cuenta de Instagram.
+# No recomendado desde un VPS: Instagram suspende cuentas que inician sesión desde IPs de datacenter.
+instagrapi>=3.0.0

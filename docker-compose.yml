@@ -3,9 +3,19 @@ services:
     build: .
     container_name: tg_video_downloader
     restart: unless-stopped
+    # Red del host: necesario para usar las IPv6 del /64 (IPV6_PREFIX) y el proxy WARP local
+    network_mode: host
     env_file:
       - .env
     volumes:
       - ./cache.db:/app/cache.db
       - ./bot_users.db:/app/bot_users.db
+    depends_on:
+      - bgutil-provider
 
+  # Servidor que genera PO tokens de YouTube sin cuenta (escucha en 127.0.0.1:4416)
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    container_name: bgutil_provider
+    restart: unless-stopped
+    network_mode: host

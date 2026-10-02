@@ -1,7 +1,7 @@
 import os
 import sys
 import asyncio
-from downloader import VideoDownloader, detect_platform, format_duration, is_youtube_url, is_spotify_url
+from downloaders import VideoDownloader, detect_platform, format_duration, is_youtube_url, is_spotify_url
 
 
 async def main():
@@ -70,6 +70,8 @@ async def main():
 
     except Exception as e:
         print(f"\n❌ Error al descargar: {e}")
+        if getattr(e, "detail", ""):
+            print(f"   Detalle técnico: {e.detail[:500]}")
 
 
 if __name__ == "__main__":
